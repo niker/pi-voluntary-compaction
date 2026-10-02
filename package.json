@@ -1,14 +1,40 @@
 {
   "name": "pi-voluntary-compaction",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Voluntary agent-driven context compaction suite for Pi harness",
   "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/niker/pi-voluntary-compaction.git"
+  },
+  "homepage": "https://github.com/niker/pi-voluntary-compaction#readme",
+  "bugs": {
+    "url": "https://github.com/niker/pi-voluntary-compaction/issues"
+  },
   "type": "module",
-  "files": ["src", "instructions", "index.ts", "README.md", "LICENSE", "NOTICE"],
-  "scripts": {"typecheck": "tsc --noEmit", "test": "npm run typecheck"},
-  "keywords": ["pi-agent", "pi-package", "context-management", "context-compact", "checkpoint"],
+  "files": [
+    "src",
+    "instructions",
+    "index.ts",
+    "README.md",
+    "LICENSE",
+    "NOTICE"
+  ],
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "npm run typecheck"
+  },
+  "keywords": [
+    "pi-agent",
+    "pi-package",
+    "context-management",
+    "context-compact",
+    "checkpoint"
+  ],
   "pi": {
-    "extensions": ["./src/index.ts"]
+    "extensions": [
+      "./src/index.ts"
+    ]
   },
   "devDependencies": {
     "@earendil-works/pi-ai": "^1.0.0",
