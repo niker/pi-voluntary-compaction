@@ -1,0 +1,22 @@
+{
+  "name": "pi-voluntary-compaction",
+  "version": "1.0.0",
+  "description": "Voluntary agent-driven context compaction suite for Pi harness",
+  "license": "Apache-2.0",
+  "type": "module",
+  "files": ["src", "instructions", "index.ts", "README.md", "LICENSE", "NOTICE"],
+  "scripts": {"typecheck": "tsc --noEmit", "test": "npm run typecheck"},
+  "keywords": ["pi-agent", "pi-package", "context-management", "context-compact", "checkpoint"],
+  "pi": {
+    "extensions": ["./src/index.ts"]
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "^1.0.0",
+    "@earendil-works/pi-coding-agent": "^1.0.0",
+    "typescript": "^7.0.2"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*"
+  }
+}

@@ -1,0 +1,13 @@
+pi-voluntary-compaction
+Copyright 2026 NIKER (Martin Němeček)
+
+This project includes software developed as part of the Pi agent extension ecosystem.
+
+
+Attribution Notice:
+This project is an implementation of the author's original approach to agent-driven voluntary context management.
+If you create an independent implementation, reimplementation, or substantially similar project based on studying this project or its documentation, attribution is appreciated:
+
+  "Inspired by pi-voluntary-compaction by NIKER."
+
+Redistribution of this project or a derivative work is subject to the applicable terms of the Apache License, Version 2.0. This includes retaining applicable notices from this NOTICE file as required by the license.
