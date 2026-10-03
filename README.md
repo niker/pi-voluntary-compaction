@@ -35,7 +35,7 @@ This strategy maintains optimal attention performance and low context utilizatio
 This layer effectively prevents the model from choking itself on massive console output or website and allows it to seamlessly read files beyond the usual 2000-line/50kb limit of PI.
 
 When any agent tool returns an oversized output (messy bash output, huge text files), the harness intercepts the payload before it enters the model's context. The raw text is held in-memory or streamed from the source file, only metadata containing approximate token size and a handle to the output are sent to the agent. 
-The model then decides whether to brute-force the output via `output_receive_full` or processes it by smaller chunks using pagination (`output_receive_paginate`).
+The model should prefer smaller chunks using pagination (`output_receive_paginate`); full retrieval via `output_receive_full` is discouraged unless needed. Both retrieval tools check the projected context use against the hard threshold and refuse a chunk that would reach or exceed it, triggering the hard-limit checkpoint interruption.
 
 
 ## Agent tools
@@ -58,8 +58,8 @@ Subagents and headless agents must use this variant, that has stripped user-faci
 ### Tool output
 
 Large tool outputs receive numerical IDs and are session-bound.
-- `output_receive_full` - retrieves the complete output by `id` regardless of size
-- `output_receive_paginate` - allows agent to process output by `id` in smaller chunks with `take`, and `offset`.
+- `output_receive_full` - retrieves the complete output by `id` only when it fits below the hard context threshold; discouraged unless full output is needed
+- `output_receive_paginate` - allows agent to process output by `id` in smaller chunks with `take`, and `offset`; chunks that would reach or exceed the hard threshold are refused.
 
 Agents can freely create a checkpoint between a tool call and output_receive, but buffered output data is lost when session exits - output processing can't be resumed in-flight.
 

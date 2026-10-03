@@ -78,6 +78,27 @@ function usagePercent(ctx: ExtensionContext): number | null {
   return usage.contextWindow > 0 && usage.tokens != null ? usage.tokens / usage.contextWindow * 100 : null;
 }
 
+function projectedHardHeadroomPercent(ctx: ExtensionContext, additionalTokens: number): number | null {
+  const usage = ctx.getContextUsage();
+  if (!usage || usage.contextWindow <= 0) return null;
+  const tokens = usage.tokens ?? (usage.percent == null ? null : usage.percent / 100 * usage.contextWindow);
+  if (tokens == null || !Number.isFinite(tokens)) return null;
+  return config.hardThresholdPercent - (tokens + additionalTokens) / usage.contextWindow * 100;
+}
+
+function outputRetrievalNotice(ctx: ExtensionContext, id: number, estimatedTokens: number): string {
+  const headroom = projectedHardHeadroomPercent(ctx, estimatedTokens);
+  const prefix = `Tool output ID ${id} was too large (~${estimatedTokens} tokens).`;
+  if (headroom == null) {
+    return `${prefix} Retrieve using 'output_receive_full' or 'output_receive_paginate'.`;
+  }
+  if (headroom <= 0) {
+    return `${prefix} Retrieve using 'output_receive_paginate'. Full read will not fit in your context.`;
+  }
+  const formattedHeadroom = Number.isInteger(headroom) ? String(headroom) : headroom.toFixed(1);
+  return `${prefix} Retrieve using 'output_receive_full' or 'output_receive_paginate'. Remaining context after full read would be ${formattedHeadroom}%.`;
+}
+
 const CHECKPOINT_ENTRY_TYPE = "pi-voluntary-compaction-checkpoint";
 
 type CheckpointLabel = { id: number; name: string };
@@ -574,6 +595,26 @@ ${checkpointListForInterruption(ctx)}`;
     }
   };
 
+  const triggerHardInterruption = (ctx: ExtensionContext) => {
+    if (hardFired) return;
+    try {
+      if (hardThinkingPrevious === null) {
+        hardThinkingPrevious = pi.getThinkingLevel();
+        pi.setThinkingLevel("off");
+      }
+      hardJumpPending = true;
+      hardInterruptionPending = true;
+      hardFired = true;
+      dispatchHardInterruption(ctx);
+      if (ctx.hasUI) ctx.ui.notify(`pi-voluntary-compaction: hard warning (${config.hardThresholdPercent}%)`, "error");
+    } catch {
+      hardFired = false;
+      hardJumpPending = false;
+      hardInterruptionPending = false;
+      restoreHardThinking();
+    }
+  };
+
   const evaluatePressure = (ctx: ExtensionContext) => {
     // Do not inject a pressure warning while a terminating checkpoint_jump
     // is waiting for agent_end to apply its payload.
@@ -585,39 +626,12 @@ ${checkpointListForInterruption(ctx)}`;
     // remaining above soft, and the next hard breach must still warn again.
     if (percent < config.softThresholdPercent) softFired = false;
     if (percent < config.hardThresholdPercent) {
-      hardFired = false;
+      if (!hardJumpPending) hardFired = false;
       assistantBumpPending = false;
     }
     if (percent < config.softThresholdPercent) return;
     if (percent >= config.hardThresholdPercent) {
-      if (hardFired) return;
-      try {
-        // Reasoning can consume the remaining output budget while the agent
-        // debates how to summarize. Preserve the user's level and disable it
-        // until checkpoint_jump either completes or fails.
-        if (hardThinkingPrevious === null) {
-          hardThinkingPrevious = pi.getThinkingLevel();
-          pi.setThinkingLevel("off");
-        }
-        // Arm the forced jump before dispatching. The hard interruption is
-        // intentionally sent immediately; waiting for tool-result persistence
-        // can allow critical context pressure to consume the remaining budget.
-        hardJumpPending = true;
-        hardInterruptionPending = true;
-        hardFired = true;
-        // Do not add a synthetic assistant message here. With an immediate
-        // steer, that synthetic stop can make reasoning providers return an
-        // empty assistant response instead of executing checkpoint_jump.
-        // Do not wait for agent_settled: at the hard threshold the current
-        // response/tool output may already be consuming the last safe context.
-        dispatchHardInterruption(ctx);
-        if (ctx.hasUI) ctx.ui.notify(`pi-voluntary-compaction: hard warning (${config.hardThresholdPercent}%)`, "error");
-      } catch {
-        hardFired = false;
-        hardJumpPending = false;
-        hardInterruptionPending = false;
-        restoreHardThinking();
-      }
+      triggerHardInterruption(ctx);
       return;
     }
     if (!softFired) {
@@ -690,7 +704,7 @@ ${checkpointListForInterruption(ctx)}`;
         return {
           content: [{
             type: "text" as const,
-            text: `Tool output ID ${id} was too large (~${estimatedTokens} tokens). Retrieve using 'output_receive_full' or 'output_receive_paginate'.`,
+            text: outputRetrievalNotice(ctx, id, estimatedTokens),
           }],
           details: {},
         };
@@ -712,7 +726,7 @@ ${checkpointListForInterruption(ctx)}`;
     });
     const notice = {
       type: "text" as const,
-      text: `Tool output ID ${id} was too large (~${estimatedTokens} tokens). Retrieve using 'output_receive_full' or 'output_receive_paginate'.`,
+      text: outputRetrievalNotice(ctx, id, estimatedTokens),
     };
     // Keep related images intact and in context; only the oversized text is paginated.
     const content: any[] = [];
@@ -873,11 +887,17 @@ ${checkpointListForInterruption(ctx)}`;
   const receiveFullParams = Type.Object({ id: outputIdParam });
   pi.registerTool({
     name: "output_receive_full", label: "Receive full tool output",
-    description: "Retrieve the complete oversized tool output when you accept its size above the configured safe limit. Output does not persist between sessions.",
+    description: "Discouraged: retrieve the complete oversized output only when the full text is necessary and it fits below the hard context threshold. Prefer output_receive_paginate to inspect only the relevant portion. Output does not persist between sessions.",
+    promptSnippet: "Avoid full output retrieval unless required; prefer pagination, and respect hard-limit refusals.",
     parameters: receiveFullParams,
-    async execute(_toolCallId, params: Static<typeof receiveFullParams>, signal) {
+    async execute(_toolCallId, params: Static<typeof receiveFullParams>, signal, _update, ctx) {
       const output = pendingToolOutputs.get(params.id);
       if (!output) return textResult(`Requested output ID ${params.id} was not found.`);
+      const headroom = projectedHardHeadroomPercent(ctx, output.estimatedTokens);
+      if (headroom !== null && headroom <= 0) {
+        triggerHardInterruption(ctx);
+        return textResult(`Refused to retrieve output ID ${params.id}: the full output would reach or exceed the hard context threshold (${config.hardThresholdPercent}%). A hard-limit checkpoint interruption was triggered. Prefer a smaller output_receive_paginate chunk after checkpointing.`);
+      }
       if (output.kind === "memory") return { content: output.content, details: output.details };
       try {
         const text = await readReadFileFull(output.file, signal);
@@ -897,11 +917,16 @@ ${checkpointListForInterruption(ctx)}`;
     name: "output_receive_paginate", label: "Paginate tool output",
     description: "Retrieve a chunk of oversized tool text using an estimated-token offset and size. Images remain intact in the original result and are not paginated. Use successive offsets and checkpoint_jump to process large outputs incrementally. Output does not persist between sessions.",
     parameters: receivePaginateParams,
-    async execute(_toolCallId, params: Static<typeof receivePaginateParams>, signal) {
+    async execute(_toolCallId, params: Static<typeof receivePaginateParams>, signal, _update, ctx) {
       const output = pendingToolOutputs.get(params.id);
       if (!output) return textResult(`Requested output ID ${params.id} was not found.`);
       const offset = Math.min(params.offset, output.estimatedTokens);
       const take = Math.min(params.take, output.estimatedTokens - offset);
+      const headroom = projectedHardHeadroomPercent(ctx, take);
+      if (headroom !== null && headroom <= 0) {
+        triggerHardInterruption(ctx);
+        return textResult(`Refused to retrieve ${take} tokens from output ID ${params.id}: this chunk would reach or exceed the hard context threshold (${config.hardThresholdPercent}%). A hard-limit checkpoint interruption was triggered. Retry with a smaller chunk after checkpointing.`);
+      }
       try {
         const content = output.kind === "memory"
           ? paginateContent(output.content, offset, take)

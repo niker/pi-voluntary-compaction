@@ -23,7 +23,7 @@ The jump payload is context for your past self, not a user-facing report. It is 
 - You must use `checkpoint_create` before every file read, download or command with potentially messy output.
 - Give each checkpoint a short description of the task about to begin.
 - When any tool returns a messy output, it will be held back until you explicitly accept it with `output_receive_full` or `output_receive_paginate` - you can still create a checkpoint before accepting.
-- Pi's normal `read` limit (50 KiB or 2,000 lines) is handled automatically. Use `read` without manually paging just to bypass that limit. If a retrieval notice appears and you need the complete file at once, call `output_receive_full`; use `output_receive_paginate` only when intentionally processing the file in chunks.
+- Pi's normal `read` limit (50 KiB or 2,000 lines) is overriden and you can read files of any size directly. A retrieval notice will appear if the file is too large and you will be able to paginate over the content.
 
 ### After completing a task
 
