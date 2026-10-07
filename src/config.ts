@@ -1,8 +1,8 @@
 /** Default voluntary-jump behavior. User overrides are persisted sparsely. */
 export type Config = {
-  maxToolOutputTokens: number;
   softThresholdPercent: number;
   hardThresholdPercent: number;
+  workspaceReasoningBufferPercent: number;
   softMessage: string;
   hardReasoningMessage: string;
   hardNonReasoningMessage: string;
@@ -15,22 +15,21 @@ export type Config = {
 };
 
 export const DEFAULT_CONFIG: Config = {
-  maxToolOutputTokens: 4000,
   softThresholdPercent: 65,
   hardThresholdPercent: 80,
+  workspaceReasoningBufferPercent: 5,
   softMessage: [
     "[CHECKPOINT JUMP RECOMMENDED]",
-    "Finish the current narrow unit of work and preserve its useful results.",
-    "Close the narrow unit of work in progress and write all drafts to target files, then use `checkpoint_jump` to the earliest convenient checkpoint with a complete payload of the useful results.",
+    "Finish the current narrow unit of work and write all drafts to target files, then use `checkpoint_jump` to earliest convenient checkpoint with a complete payload.",
   ].join("\n"),
   hardReasoningMessage: [
     "<think>",
-    "[REASONING INTERRUPTED]: Checkpoint jump required.",
+    "Checkpoint jump required.",
     "</think>",
     "[CHECKPOINT JUMP REQUIRED]",
-    "Use `checkpoint_jump` to the earliest available checkpoint NOW with a complete payload of the useful results.",
+    "Use `checkpoint_jump` to the earliest suitable checkpoint NOW with a complete payload.",
   ].join("\n"),
-  hardNonReasoningMessage: "[CHECKPOINT JUMP REQUIRED]: Use `checkpoint_jump` to the earliest available checkpoint NOW with a complete payload of the useful results.",
+  hardNonReasoningMessage: "[CHECKPOINT JUMP REQUIRED]: Use `checkpoint_jump` to earliest suitable checkpoint NOW with a complete payload.",
   instructions: null,
   advertiseVoluntaryCompaction: true,
   afterTaskCompaction: "allowed",
