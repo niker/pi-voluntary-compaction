@@ -24,8 +24,10 @@ The strategy to prevent cumulative context degradation across multi-stage tasks:
 2. Then executes tool calls, reads, performs complex reasoning or noisy shell commands.
 3. Upon task completion or a milestone, the agent decides what information is still relevant or needed to complete the task and prepares a minimal payload that it sends itself into the past via `checkpoint_jump`.
 4. The harness prunes all conversation between the checkpoint and current state, then hands the payload back to the agent to continue work.
-5a. The agent resumes work with all the necessary context and a plan. At worst it needs to re-read some files before edits.
-5b. If the agent jumped with information that the task is completed, control is given back to the user and waits for input. The user is presented with an option to `deny` the jump and continue the conversation without compaction - this is good for many simple low-latency tasks but not strictly necessary as the payload usually carries enough information to perform repeated tasks seamlessly. 
+
+- 5a. The agent resumes work with all the necessary context and a plan. At worst it needs to re-read some files before edits.
+
+- 5b. If the agent jumped with information that the task is completed, control is given back to the user and waits for input. The user is presented with an option to `deny` the jump and continue the conversation without compaction - this is good for many simple low-latency tasks but not strictly necessary as the payload usually carries enough information to perform repeated tasks seamlessly. 
    
 This strategy maintains optimal attention performance and low context utilization without losing high-level task focus.
 
