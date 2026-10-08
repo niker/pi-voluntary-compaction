@@ -11,6 +11,7 @@ import {
   countReadFileLinesWithinTokenBudget,
   estimateLineTokens,
   estimateReadFileStats,
+  estimateTokensSafe,
   readReadFileFull,
   resolveReadSourcePath,
   type ReadFileRange,
@@ -69,18 +70,16 @@ const textResult = (text: string) => ({ content: [{ type: "text" as const, text 
 // sometimes submit a placeholder (e.g. "-- payload omited --") instead of real
 // state; accepting it destroys the conversation irrecoverably, so reject it.
 const MIN_PAYLOAD_CHARS = 40;
-const PAYLOAD_PLACEHOLDER_PATTERN = /\b(omitted|omited|elided|redacted|placeholder)\b|\(payload\)/i;
 function jumpPayloadError(payload: string): string | undefined {
   const trimmed = payload.trim();
   if (!trimmed) return "The payload is empty. Write a payload that preserves relevant knowledge since the checkpoint and includes planned next steps, then call the jump tool again.";
-  if (PAYLOAD_PLACEHOLDER_PATTERN.test(trimmed)) return `The payload looks like a placeholder (${JSON.stringify(trimmed)}). It must contain the actual accumulated state and next steps. Rewrite it and call the jump tool again; no jump was performed.`;
   if (trimmed.length < MIN_PAYLOAD_CHARS) return `The payload is too short (${trimmed.length} characters). It must preserve relevant knowledge since the checkpoint and include planned next steps. Expand it and call the jump tool again; no jump was performed.`;
   return undefined;
 }
 const payloadResult = (text: string, payload: string) => ({ content: [{ type: "text" as const, text }], details: { payload } });
 
 function estimateTextTokens(text: string): number {
-  return textLines(text).reduce((total, line) => total + estimateLineTokens(line), 0);
+  return estimateTokensSafe(text);
 }
 
 function estimateContentTokens(content: readonly any[]): number {
@@ -96,7 +95,7 @@ function contentText(content: readonly any[]): string {
 }
 
 function formatClippedReadNotice(read: ClippedRead): string {
-  return `--- BEGIN WORKSPACE NOTICE (NOT FILE CONTENT) ---\nYour read was clipped to fit the available workspace. Jump to a previous checkpoint immediately, then continue reading at offset=${read.offset + read.actualLines}.\n--- END WORKSPACE NOTICE ---`;
+  return `[Your read was clipped to fit the available workspace. You must not make further attempts to read until you Jump to a previous checkpoint; then continue reading at offset=${read.offset + read.actualLines}.]`;
 }
 
 function formatReadContinuationNotice(remainingLines: number, nextOffset: number): string {
@@ -208,29 +207,34 @@ function usagePercent(ctx: ExtensionContext): number | null {
   return usage.contextWindow > 0 && usage.tokens != null ? usage.tokens / usage.contextWindow * 100 : null;
 }
 
-// Mirror pi-ai's lightweight estimates locally instead of importing its utils
-// subpath, which is not resolvable in some supported Pi installations.
+// Use the same conservative offline estimator for prefix accounting; the
+// provider tokenizer is unavailable and Pi's utility subpath is not resolvable
+// in every supported installation.
 function estimatePiTextTokens(text: string): number {
-  return Math.ceil(text.length / 4);
+  return estimateTokensSafe(text);
 }
 
 function estimatePiMessageTokens(message: Message): number {
-  let chars = 0;
+  let tokens = 0;
   if (message.role === "user") {
     if (typeof message.content === "string") return estimatePiTextTokens(message.content);
-    for (const block of message.content) chars += block.type === "text" ? block.text.length : 4800;
-    return Math.ceil(chars / 4);
+    for (const block of message.content) {
+      tokens += block.type === "text" ? estimatePiTextTokens(block.text) : 4800;
+    }
+    return tokens;
   }
   if (message.role === "toolResult") {
-    for (const block of message.content) chars += block.type === "text" ? block.text.length : 4800;
-    return Math.ceil(chars / 4);
+    for (const block of message.content) {
+      tokens += block.type === "text" ? estimatePiTextTokens(block.text) : 4800;
+    }
+    return tokens;
   }
   for (const block of message.content) {
-    if (block.type === "text") chars += block.text.length;
-    else if (block.type === "thinking") chars += block.thinking.length;
-    else chars += block.name.length + JSON.stringify(block.arguments).length;
+    if (block.type === "text") tokens += estimatePiTextTokens(block.text);
+    else if (block.type === "thinking") tokens += estimatePiTextTokens(block.thinking);
+    else tokens += estimateTokensSafe(`${block.name}${JSON.stringify(block.arguments)}`);
   }
-  return Math.ceil(chars / 4);
+  return tokens;
 }
 
 function unaffectablePrefixTokens(ctx: ExtensionContext): number {
@@ -335,12 +339,16 @@ function checkpointRecord(value: unknown): CheckpointRecord | undefined {
   };
 }
 
+function roundedPercent(value: number): string {
+  return String(Math.sign(value) * Math.round(Math.abs(value)));
+}
+
 function formatCheckpointLabel(checkpoint: CheckpointLabel, workspaceDelta?: number): string {
   const percentage = checkpoint.workspaceUsedPercent;
   if (percentage === undefined) return `[${checkpoint.id}]: ${checkpoint.name}`;
-  const formatted = Number.isInteger(percentage) ? String(percentage) : percentage.toFixed(1);
-  const gain = workspaceDelta === undefined ? "" : `, ${workspaceDelta.toFixed(1)}% gain`;
-  return `[${checkpoint.id}]: ${checkpoint.name} (${formatted}% workspace used${gain})`;
+  const formatted = roundedPercent(percentage);
+  const delta = workspaceDelta === undefined ? "" : `, Δ ${roundedPercent(workspaceDelta)}%`;
+  return `[${checkpoint.id}]: ${checkpoint.name} (utilization: ${formatted}%${delta})`;
 }
 
 function persistedCheckpointEntries(sm: SessionManager): StoredCheckpoint[] {
@@ -400,7 +408,7 @@ function checkpointJumpNotice(sm: SessionManager, id: number): string {
     : `Jumped to checkpoint [${id}], continue from the payload`;
   const percentage = checkpoint?.workspaceUsedPercent;
   if (percentage === undefined) return `[${notice}.]`;
-  const formatted = Number.isInteger(percentage) ? String(percentage) : percentage.toFixed(1);
+  const formatted = roundedPercent(percentage);
   const generosity = percentage <= 45 ? "generous " : "";
   return `[${notice}; workspace was cleared to ${generosity}${formatted}% utilization.]`;
 }
@@ -646,6 +654,7 @@ export default function (pi: ExtensionAPI): void {
   const activeToolCalls = new Set<string>();
   let checkpointJumpCallInProgress = false;
   let checkpointJumpNamePending = false;
+  let invalidJumpInterruptionTriggered = false;
   let turnInProgress = false;
   let rebuildPending = false;
   let pendingUserQueryCheckpointName: string | null = null;
@@ -653,6 +662,7 @@ export default function (pi: ExtensionAPI): void {
   let jumpPending = false;
   let postJumpTurnProtected = false;
   let pendingJump: PendingJump | null = null;
+  let pendingForcedJumpInterruption: string | null = null;
   let pendingJumpOffer: PendingJumpOffer | null = null;
   let removeTerminalInput: (() => void) | null = null;
   let interceptorLogPath: string | null = null;
@@ -821,7 +831,7 @@ export default function (pi: ExtensionAPI): void {
     const instructions = config.instructions ?? defaultInstructions;
     if (!instructions) return;
     return {
-      systemPrompt: `${event.systemPrompt}\n\n## Voluntary context management\n\n${instructions}`,
+      systemPrompt: `${event.systemPrompt}\n\n${instructions}`,
     };
   });
 
@@ -991,6 +1001,46 @@ export default function (pi: ExtensionAPI): void {
     return checkpointMeetsMinimumJumpDistance(checkpoint, workspaceUsedPercent(ctx));
   };
 
+  const interruptInvalidCheckpointJump = (ctx: ExtensionContext, target: unknown): void => {
+    const targetLabel = typeof target === "number" || typeof target === "string"
+      ? `#${target}`
+      : "checkpoint";
+    pendingForcedJumpInterruption = `Your checkpoint_jump was interrupted because target ${targetLabel} is not valid. Choose another ID from the available checkpoints below, then retry the jump with the payload you intended to preserve.\n\nAvailable checkpoints (use one of these IDs; do not call checkpoint_list):\n${checkpointListForInterruption(ctx)}`;
+    // Unlike ordinary hard-limit steering, which waits for tool calls to
+    // finish, this must abort the current model stream before the large payload
+    // is completed or the invalid jump tool can execute.
+    hardInterruptionPending = false;
+    ctx.abort();
+  };
+
+  const inspectStreamedCheckpointJump = (
+    toolName: unknown,
+    args: any,
+    toolCallId: unknown,
+    ctx: ExtensionContext,
+  ): void => {
+    if (invalidJumpInterruptionTriggered
+      || !CHECKPOINT_JUMP_TOOL_NAMES.includes(toolName as (typeof CHECKPOINT_JUMP_TOOL_NAMES)[number])
+      || args == null
+      || !Object.prototype.hasOwnProperty.call(args, "payload")) return;
+
+    const target = args.target;
+    const sm = manager(ctx);
+    const targetIsValid = typeof target === "number"
+      && Number.isInteger(target)
+      && resolveCheckpointId(sm, target) !== undefined
+      && jumpTargetMeetsMinimumDistance(sm, target, ctx);
+    if (targetIsValid) return;
+
+    invalidJumpInterruptionTriggered = true;
+    logInterceptor("invalid_checkpoint_jump_interrupted", {
+      target: target ?? null,
+      payloadPresent: true,
+      toolCallId: toolCallId ?? null,
+    });
+    interruptInvalidCheckpointJump(ctx, target);
+  };
+
   // Call only after the jump target and payload have passed validation. A
   // rejected attempt must retain the hard-limit thinking level for its retry.
   const cancelHardInterruptionForJump = (): void => {
@@ -1135,6 +1185,7 @@ ${checkpointListForInterruption(ctx)}`;
     jumpPending = false;
     postJumpTurnProtected = false;
     pendingJump = null;
+    pendingForcedJumpInterruption = null;
     clearJumpOffer(ctx);
     interceptorLogPath = null;
     interceptorLogSequence = 0;
@@ -1319,6 +1370,7 @@ ${checkpointListForInterruption(ctx)}`;
     streamUpdateCount = 0;
     checkpointJumpCallInProgress = false;
     checkpointJumpNamePending = false;
+    invalidJumpInterruptionTriggered = false;
     logInterceptor("message_start", { message: summarizeMessageShape(event.message), ...pressureState() });
   });
   pi.on("message_update", (event, ctx) => {
@@ -1335,23 +1387,23 @@ ${checkpointListForInterruption(ctx)}`;
     // Newer JSON/RPC runtimes send message_update deltas rather than a
     // cumulative partial message. Recognize a jump directly from toolcall_start
     // so payload deltas remain protected even when no toolCall part is present.
-    if (update.type === "toolcall_start" || update.type === "toolcall_end") {
+    if (update.type === "toolcall_start" || update.type === "toolcall_delta" || update.type === "toolcall_end") {
       observedToolCall = rawUpdate.toolCall
         ?? rawUpdate.partial?.content?.[rawUpdate.contentIndex];
-      observedToolName = update.type === "toolcall_start"
-        ? rawUpdate.toolName ?? observedToolCall?.name
-        : observedToolCall?.name;
+      observedToolName = rawUpdate.toolName ?? observedToolCall?.name;
       observedToolNameSource = rawUpdate.toolName != null
         ? "toolName"
         : observedToolCall?.name != null ? "toolCall.name" : null;
       const name = observedToolName;
-      state = CHECKPOINT_JUMP_TOOL_NAMES.includes(name as (typeof CHECKPOINT_JUMP_TOOL_NAMES)[number])
-        ? "jump"
-        : typeof name !== "string" || !name
-          || (update.type === "toolcall_start"
-            && CHECKPOINT_JUMP_TOOL_NAMES.some((jumpName) => jumpName.startsWith(name)))
-          ? "unknown"
-          : "other";
+      if (update.type !== "toolcall_delta") {
+        state = CHECKPOINT_JUMP_TOOL_NAMES.includes(name as (typeof CHECKPOINT_JUMP_TOOL_NAMES)[number])
+          ? "jump"
+          : typeof name !== "string" || !name
+            || (update.type === "toolcall_start"
+              && CHECKPOINT_JUMP_TOOL_NAMES.some((jumpName) => jumpName.startsWith(name)))
+            ? "unknown"
+            : "other";
+      }
     }
     // Partial snapshots are not guaranteed to retain toolCall parts on every
     // update. Keep a recognized jump/name guard latched until a later update
@@ -1360,6 +1412,12 @@ ${checkpointListForInterruption(ctx)}`;
       checkpointJumpCallInProgress = state === "jump";
       checkpointJumpNamePending = state === "unknown";
     }
+    inspectStreamedCheckpointJump(
+      observedToolName ?? observedToolCall?.name,
+      observedToolCall?.arguments,
+      rawUpdate.id ?? observedToolCall?.id,
+      ctx,
+    );
     // Re-check usage during streaming, after observing the partial tool name.
     // This lets us steer ordinary reasoning/output immediately while shielding
     // only a checkpoint_jump call whose name is already visible (or unresolved).
@@ -1389,6 +1447,11 @@ ${checkpointListForInterruption(ctx)}`;
   });
   pi.on("message_end", (event, ctx) => {
     if (event.message.role !== "assistant") return;
+    for (const part of Array.isArray(event.message.content) ? event.message.content : []) {
+      if (part?.type === "toolCall") {
+        inspectStreamedCheckpointJump(part.name, part.arguments, part.id, ctx);
+      }
+    }
     const before = pressureState();
     const state = checkpointJumpStreamState(event.message, true);
     checkpointJumpCallInProgress = state === "jump";
@@ -1654,9 +1717,9 @@ ${checkpointListForInterruption(ctx)}`;
     pi.registerTool({
       ...readLoadoutOverride,
       name, label,
-      description: "Creates a new checkpoint, so you can later jump back.",
-      promptSnippet: "Create a checkpoint, you can jump back to it after doing work. Checkpoint contains all your actions up to that point.",
-      promptGuidelines: ["Always create a checkpoint before large reads, series of bash commands or after clarifying an assignment."],
+      description: "Creates a new checkpoint to which you can jump after doing work.",
+      promptSnippet: "Create a checkpoint to which you can jump after doing work.",
+      promptGuidelines: ["Always create a checkpoint before large reads, before series of bash commands, after initial clarification of your assignment (what does the user actually want me to do)."],
       parameters: createParams,
       execute: createCheckpoint,
     });
@@ -1667,8 +1730,8 @@ ${checkpointListForInterruption(ctx)}`;
     ...readLoadoutOverride,
     name: "checkpoint_list", label: "List available checkpoints",
     description: "List available checkpoints and IDs.",
-    promptSnippet: "List available checkpoints, their IDs and workspace utilization at that time.",
-    promptGuidelines: ["Chose a suitable jump target."],
+    promptSnippet: "List available checkpoints, their IDs, workspace utilization at the time the checkpoint was created and workspace utilization delta from current state.",
+    promptGuidelines: ["Chose a suitable jump target; balance freeing sufficient part of the workspace while retaining knowledge locked-in by secondary accumulation checkpoints. Do not automatically target the lowest utilization - be strategic."],
     parameters: listParams,
     async execute(_id, params: Static<typeof listParams>, _signal, _update, ctx) {
       const sm = manager(ctx);
@@ -1682,18 +1745,18 @@ ${checkpointListForInterruption(ctx)}`;
 
   const jumpParams = Type.Object({
     target: Type.Number({ multipleOf: 1, description: "Numeric checkpoint ID returned by checkpoint_create or shown by checkpoint_list." }),
-    payload: Type.String({ description: "Payload that selectively preserves all relevant knowledge acquired since the target checkpoint was created and includes planned next steps. Must be concrete state; empty or placeholder payloads (e.g. '-- omitted --') are rejected." }),
+    payload: Type.String({ description: "Payload that meticulously preserves all relevant knowledge acquired since the target checkpoint and includes planned next steps." }),
     task_completed: Type.Optional(Type.Boolean({ description: "Use true only after you already reported task completion to the user." })),
   });
   const subagentJumpParams = Type.Object({
     target: Type.Number({ multipleOf: 1, description: "Numeric checkpoint ID returned by subagent_checkpoint_create." }),
-    payload: Type.String({ description: "Payload that selectively preserves all relevant knowledge acquired since the target checkpoint was created and includes planned next steps. Must be concrete state; empty or placeholder payloads (e.g. '-- omitted --') are rejected." }),
+    payload: Type.String({ description: "Payload that meticulously preserves all relevant knowledge acquired since the target checkpoint and includes planned next steps." }),
   });
   pi.registerTool({
     ...readLoadoutOverride,
     name: "checkpoint_jump", label: "Jump to checkpoint",
     description: "Jump to a checkpoint and continue with the supplied payload.",
-    promptSnippet: "Jump to a checkpoint after completing a unit of work; always include a relevant payload.",
+    promptSnippet: "Jump to a checkpoint after completing a unit of work; always include a relevant payload. Restores the workspace and conversation state to that of the target checkpoint.",
     promptGuidelines: ["Include relevant facts, decisions, completed actions, side effects, unresolved issues, and the next action in the payload."],
     parameters: jumpParams,
     renderCall(args, theme, context) { return renderJumpCall("checkpoint_jump", args, theme, context); },
@@ -1734,7 +1797,7 @@ ${checkpointListForInterruption(ctx)}`;
   pi.registerTool({
     ...readLoadoutOverride,
     name: "output_receive_full", label: "Receive full tool output",
-    description: "Accept the complete large output only when the full text is necessary and fits in your available workspace.",
+    description: "Accept the complete large output, assuming it fits in your available workspace.",
     parameters: receiveFullParams,
     async execute(_toolCallId, params: Static<typeof receiveFullParams>, _signal, _update, ctx) {
       const output = pendingToolOutputs.get(params.id);
@@ -1746,7 +1809,7 @@ ${checkpointListForInterruption(ctx)}`;
       if (output.estimatedTokens > workspaceTokens) {
         const recommendedPage = outputPageWithinBudget(output, params.id, 1, Math.max(0, workspaceTokens));
         if (!recommendedPage) {
-          return textResult(`No complete lines from output ID ${params.id} fit in the available workspace. Jump to an earlier checkpoint before retrieving it using 'output_receive_full' or 'output_receive_paginate'.`);
+          return textResult(`No complete lines from output ID ${params.id} fit in the available workspace. You must not make further attempts to read until you Jump to a previous checkpoint; then retrieve the output using 'output_receive_full' or 'output_receive_paginate'.`);
         }
         return textResult(`Full output was not accepted because it does not fit in the available workspace. Retrieve output ID ${params.id} using output_receive_paginate with offset 1 and limit ${recommendedPage.lineCount}.`);
       }
@@ -1762,7 +1825,7 @@ ${checkpointListForInterruption(ctx)}`;
   pi.registerTool({
     ...readLoadoutOverride,
     name: "output_receive_paginate", label: "Paginate tool output",
-    description: "Accept a page of large output using a line-based offset and optional limit. If limit is omitted, automatically choose a page size that fits the current workspace while preserving the reasoning buffer. Use successive offsets and checkpoint_jump to process large outputs incrementally.",
+    description: "Accept a page of large output using a line-based offset and optional limit. If limit is omitted, automatically choose a page size that fits the current workspace. Use successive offsets and checkpoint_jump to process large outputs incrementally.",
     parameters: receivePaginateParams,
     async execute(_toolCallId, params: Static<typeof receivePaginateParams>, _signal, _update, ctx) {
       const output = pendingToolOutputs.get(params.id);
@@ -1780,7 +1843,7 @@ ${checkpointListForInterruption(ctx)}`;
         } else {
           const recommendedPage = outputPageWithinBudget(output, params.id, offset, Math.max(0, workspaceTokens));
           if (!recommendedPage) {
-            return textResult(`No complete lines from output ID ${params.id} fit in the available workspace. Jump to an earlier checkpoint before retrieving the next page using 'output_receive_paginate'.`);
+            return textResult(`No complete lines from output ID ${params.id} fit in the available workspace. You must not make further attempts to read until you Jump to a previous checkpoint; then retry this 'output_receive_paginate' call.`);
           }
           limit = recommendedPage.lineCount;
         }
@@ -1794,9 +1857,9 @@ ${checkpointListForInterruption(ctx)}`;
       if (workspaceTokens <= 0 || estimateTextTokens(resultText) > workspaceTokens) {
         const recommendedPage = outputPageWithinBudget(output, params.id, offset, Math.max(0, workspaceTokens));
         if (!recommendedPage) {
-          return textResult(`No complete lines from output ID ${params.id} fit in the available workspace. Jump to an earlier checkpoint before retrieving the next page.`);
+          return textResult(`No complete lines from output ID ${params.id} fit in the available workspace. You must not make further attempts to read until you Jump to a previous checkpoint; then retry this 'output_receive_paginate' call.`);
         }
-        return textResult(`The requested page does not fit in available workspace. Retry with limit ${recommendedPage.lineCount}, or jump to an earlier checkpoint before retrieving output ID ${params.id}.`);
+        return textResult(`The requested page does not fit in available workspace. Option 1: Retry with ${recommendedPage.lineCount} line limit that currently fits; Option 2: Jump to a previous checkpoint; then retry this 'output_receive_paginate' call.`);
       }
       return {
         content: [{ type: "text" as const, text: resultText }],
@@ -1854,6 +1917,22 @@ ${checkpointListForInterruption(ctx)}`;
         evaluatePressure(ctx);
       }
       dispatchHardInterruption(ctx);
+      const forcedInterruption = pendingForcedJumpInterruption;
+      pendingForcedJumpInterruption = null;
+      if (forcedInterruption) {
+        const deliverAfterAbort = (): void => {
+          if (!ctx.isIdle()) {
+            setTimeout(deliverAfterAbort, 25);
+            return;
+          }
+          try {
+            pi.sendUserMessage(forcedInterruption);
+          } catch (error) {
+            logInterceptor("invalid_checkpoint_jump_followup_failed", { error: String(error) });
+          }
+        };
+        setTimeout(deliverAfterAbort, 0);
+      }
       return;
     }
 

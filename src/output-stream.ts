@@ -13,12 +13,27 @@ export type ReadFileRange = {
 };
 
 const UNICODE_SPACES = /[\u00A0\u2000-\u200A\u202F\u205F\u3000]/g;
-// Conservative preflight estimate.
-// Pi does not expose the provider's tokenizer, so keep extra headroom here.
-const ESTIMATED_CHARACTERS_PER_TOKEN = 2.0;
+const CODE_SYMBOLS = /[{}[\]()<>=;:_/\\"'`\t]/g;
 
+/** Conservative offline estimate; provider tokenizers are not available here. */
+export function estimateTokensSafe(text: string): number {
+  if (!text) return 0;
+
+  const words = text.trim().split(/\s+/);
+  const wordCount = words.length;
+  const charCount = text.length;
+  const codeSymbolRatio = (text.match(CODE_SYMBOLS) ?? []).length / charCount;
+  const isCodeOrJson = codeSymbolRatio > 0.08;
+
+  const estimatedTokens = isCodeOrJson
+    ? Math.ceil(charCount * 0.38)
+    : Math.ceil(Math.max(wordCount * 1.33, charCount * 0.30));
+  return Math.ceil(estimatedTokens * 1.05);
+}
+
+/** Estimate one line plus its separator for incremental line-based budgeting. */
 export function estimateLineTokens(line: string): number {
-  return Math.ceil((Array.from(line).length + 1) / ESTIMATED_CHARACTERS_PER_TOKEN);
+  return estimateTokensSafe(`${line}\n`);
 }
 
 /** Resolve the local path using the same common expansions as Pi's read tool. */

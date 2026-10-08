@@ -25,9 +25,8 @@ The strategy to prevent cumulative context degradation across multi-stage tasks:
 3. Upon task completion or a milestone, the agent decides what information is still relevant or needed to complete the task and prepares a minimal payload that it sends itself into the past via `checkpoint_jump`.
 4. The harness prunes all conversation between the checkpoint and current state, then hands the payload back to the agent to continue work.
 
-- 5a. The agent resumes work with all the necessary context and a plan. At worst it needs to re-read some files before edits.
-
-- 5b. If the agent jumped with information that the task is completed, control is given back to the user and waits for input. The user is presented with an option to `deny` the jump and continue the conversation without compaction - this is good for many simple low-latency tasks but not strictly necessary as the payload usually carries enough information to perform repeated tasks seamlessly. 
+ - 5a. The agent resumes work with all the necessary context and a plan. At worst it needs to re-read some files before edits.
+ - 5b. If the agent jumped with information that the task is completed, control is given back to the user and waits for input. The user is presented with an option to `deny` the jump and continue the conversation without compaction - this is good for many simple low-latency tasks but not strictly necessary as the payload usually carries enough information to perform repeated tasks seamlessly. 
    
 This strategy maintains optimal attention performance and low context utilization without losing high-level task focus.
 
@@ -36,8 +35,7 @@ This strategy maintains optimal attention performance and low context utilizatio
 
 This layer effectively prevents the model from choking itself on massive console output or website and allows it to seamlessly read files beyond the usual 2000-line/50kb limit of PI.
 
-When any agent tool returns an oversized output (messy bash output, huge text files), the harness intercepts the payload before it enters the model's context. The raw text is held in-memory or streamed from the source file, only metadata containing approximate token size and a handle to the output are sent to the agent. 
-The model should prefer smaller chunks using pagination (`output_receive_paginate`); full retrieval via `output_receive_full` is discouraged unless needed. Both retrieval tools check the projected context use against the hard threshold and refuse a chunk that would reach or exceed it, triggering the hard-limit checkpoint interruption.
+Tool output is intercepted before it enters the model's context when it exceeds the dynamic workspace (context remaining after the hard-threshold reserve and workspace reasoning buffer). For `read`, the harness accepts full file contents when they fit, including contents beyond Pi's usual 2,000-line/50 KB read limit. If a read will not fit, it is denied with a recommended line count; jump to an earlier checkpoint to free workspace, then retry with `offset`/`limit`. For other tools, output that fits is accepted in full; oversized output is accepted as a first line-based chunk sized for the available workspace. Continue with `output_receive_paginate`, or use `output_receive_full` after freeing workspace if the complete output will then fit. If no complete line fits, the output is denied with guidance to jump to an earlier checkpoint and retry with less output. Interception is informational and does not itself trigger a checkpoint interruption.
 
 
 ## Agent tools
@@ -45,7 +43,10 @@ The model should prefer smaller chunks using pagination (`output_receive_paginat
 ### Checkpointing
 
 - `checkpoint_create` — create a checkpoint with arbitrary name and receive its numeric ID.
-- `checkpoint_list` — list checkpoint IDs and names in the form `[1]: Checkpoint name`.
+- `checkpoint_list` — list eligible checkpoint IDs, names, recorded workspace usage, and utilization delta. For targets above the soft threshold, checkpoints that do not meet the configured minimum jump distance are omitted. Workspace usage is context tokens divided by the ingestible workspace capacity (hard threshold minus the workspace reasoning buffer), capped at 100%.
+
+For emergencies, invisible checkpoint 0 marks the initial user query.
+
 - `checkpoint_jump` — jump to a checkpoint with a payload and continue. Set `task_completed: true` to stop and wait for user input. In interactive TUI mode this leaves a decision line above the editor; **Alt+C** toggles whether the jump is applied when the next message arrives. In pi-web sessions, use `/jump` or `/nojump` before the next real message to choose the pending decision; omitting either command keeps the configured default.
 
 
@@ -60,8 +61,8 @@ Subagents and headless agents must use this variant, that has stripped user-faci
 ### Tool output
 
 Large tool outputs receive numerical IDs and are session-bound.
-- `output_receive_full` - retrieves the complete output by `id` only when it fits below the hard context threshold; discouraged unless full output is needed
-- `output_receive_paginate` - allows agent to process output by `id` in smaller chunks with `take`, and `offset`; chunks that would reach or exceed the hard threshold are refused.
+- `output_receive_full` - retrieves the complete output by `id` when it fits in available workspace, for example after a checkpoint jump
+- `output_receive_paginate` - retrieves a later page by `id` using a 1-based line `offset` and optional maximum line `limit`; use successive offsets and `checkpoint_jump` to process large outputs incrementally.
 
 Agents can freely create a checkpoint between a tool call and output_receive, but buffered output data is lost when session exits - output processing can't be resumed in-flight.
 
@@ -70,8 +71,9 @@ Agents can freely create a checkpoint between a tool call and output_receive, bu
 
 You can configure pretty much everything important:
 - soft/hard context utilization limits
+- workspace reasoning buffer for automatic read/output retrieval sizing (default 5%, range 0-25%)
+- minimum workspace-utilization difference required for a checkpoint jump (default 7.5%)
 - soft/hard limit messages that steer the agent
-- max tool output size that is not intercepted
 - built-in injected system prompt that teaches agent voluntary compaction
 - default jump allow/deny after task completion
 - outright disable any context injection
