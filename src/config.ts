@@ -3,6 +3,7 @@ export type Config = {
   softThresholdPercent: number;
   hardThresholdPercent: number;
   workspaceReasoningBufferPercent: number;
+  minimumJumpDistance: number;
   softMessage: string;
   hardReasoningMessage: string;
   hardNonReasoningMessage: string;
@@ -18,6 +19,7 @@ export const DEFAULT_CONFIG: Config = {
   softThresholdPercent: 65,
   hardThresholdPercent: 80,
   workspaceReasoningBufferPercent: 5,
+  minimumJumpDistance: 7.5,
   softMessage: [
     "[CHECKPOINT JUMP RECOMMENDED]",
     "Finish the current narrow unit of work and write all drafts to target files, then use `checkpoint_jump` to earliest convenient checkpoint with a complete payload.",

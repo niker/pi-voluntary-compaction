@@ -7,6 +7,7 @@ import { matchesKey, Text } from "@earendil-works/pi-tui";
 import { Type, type Message, type Static } from "@earendil-works/pi-ai";
 import { config, DEFAULT_CONFIG, type Config } from "./config.js";
 import {
+  countReadFileLinesFromOffset,
   countReadFileLinesWithinTokenBudget,
   estimateLineTokens,
   estimateReadFileStats,
@@ -95,7 +96,16 @@ function contentText(content: readonly any[]): string {
 }
 
 function formatClippedReadNotice(read: ClippedRead): string {
-  return `[Your workspace is full and read limit was reduced to fit; jump to previous checkpoint immediatelly. Use offset=${read.offset + read.actualLines} to continue reading after jump.]`;
+  return `--- BEGIN WORKSPACE NOTICE (NOT FILE CONTENT) ---\nYour read was clipped to fit the available workspace. Jump to a previous checkpoint immediately, then continue reading at offset=${read.offset + read.actualLines}.\n--- END WORKSPACE NOTICE ---`;
+}
+
+function formatReadContinuationNotice(remainingLines: number, nextOffset: number): string {
+  return `[${remainingLines} more lines in file. Use offset=${nextOffset} to continue.]`;
+}
+
+function appendBottomNotice(text: string, notice: string): string {
+  const body = text.replace(/[\r\n]+$/, "");
+  return body ? `${body}\n\n${notice}` : notice;
 }
 
 function appendNoticeToContent(content: readonly any[], notice: string): any[] {
@@ -105,9 +115,8 @@ function appendNoticeToContent(content: readonly any[], notice: string): any[] {
       // Replace Pi's generic continuation footer: it doesn't mention that the
       // requested limit was clipped and competes with the jump instruction.
       const text = result[index].text
-        .replace(/\s*\[\d+ more lines in file\. Use offset=\d+ to continue\.\]\s*$/, "")
-        .trimEnd();
-      result[index].text = `${text}${text ? "\n\n" : ""}${notice}`;
+        .replace(/\s*\[\d+ more lines in file\. Use offset=\d+ to continue\.\]\s*$/, "");
+      result[index].text = appendBottomNotice(text, notice);
       return result;
     }
   }
@@ -155,9 +164,7 @@ function formatOutputPage(pageText: string, id: number, offset: number, pageLine
   const continuation = nextOffset > totalLines
     ? "[This was the last page.]"
     : `[To continue, call 'output_receive_paginate' with id ${id}, offset ${nextOffset} and a suitable limit.]`;
-  return pageText
-    ? `${pageText}${pageText.endsWith("\n") ? "\n" : "\n\n"}${continuation}`
-    : continuation;
+  return appendBottomNotice(pageText, continuation);
 }
 
 function outputPageWithinBudget(
@@ -328,11 +335,12 @@ function checkpointRecord(value: unknown): CheckpointRecord | undefined {
   };
 }
 
-function formatCheckpointLabel(checkpoint: CheckpointLabel): string {
+function formatCheckpointLabel(checkpoint: CheckpointLabel, workspaceDelta?: number): string {
   const percentage = checkpoint.workspaceUsedPercent;
   if (percentage === undefined) return `[${checkpoint.id}]: ${checkpoint.name}`;
   const formatted = Number.isInteger(percentage) ? String(percentage) : percentage.toFixed(1);
-  return `[${checkpoint.id}]: ${checkpoint.name} (${formatted}% workspace used)`;
+  const gain = workspaceDelta === undefined ? "" : `, ${workspaceDelta.toFixed(1)}% gain`;
+  return `[${checkpoint.id}]: ${checkpoint.name} (${formatted}% workspace used${gain})`;
 }
 
 function persistedCheckpointEntries(sm: SessionManager): StoredCheckpoint[] {
@@ -417,8 +425,32 @@ function persistCheckpoint(pi: ExtensionAPI, ctx: ExtensionContext, name: string
   return record;
 }
 
-function listedCheckpointEntries(sm: SessionManager): StoredCheckpoint[] {
-  return checkpointEntries(sm).filter(({ checkpoint }) => checkpoint.id !== 0);
+function checkpointWorkspaceDelta(checkpoint: CheckpointLabel, currentWorkspacePercent: number | null): number | undefined {
+  if (currentWorkspacePercent === null || checkpoint.workspaceUsedPercent === undefined) return undefined;
+  return currentWorkspacePercent - checkpoint.workspaceUsedPercent;
+}
+
+function checkpointMeetsMinimumJumpDistance(checkpoint: CheckpointLabel, currentWorkspacePercent: number | null): boolean {
+  const delta = checkpointWorkspaceDelta(checkpoint, currentWorkspacePercent);
+  if (delta === undefined || checkpoint.workspaceUsedPercent === undefined) return false;
+  return checkpoint.workspaceUsedPercent <= config.softThresholdPercent || delta >= config.minimumJumpDistance;
+}
+
+function eligibleJumpCheckpoints(
+  sm: SessionManager,
+  currentWorkspacePercent: number | null,
+): Array<{ checkpoint: CheckpointLabel; targetId: string; workspaceDelta: number }> {
+  if (currentWorkspacePercent === null) return [];
+  return checkpointEntries(sm)
+    .filter(({ checkpoint }) => checkpoint.id !== 0)
+    .map(({ checkpoint, targetId }) => ({
+      checkpoint,
+      targetId,
+      workspaceDelta: checkpointWorkspaceDelta(checkpoint, currentWorkspacePercent),
+    }))
+    .filter((entry): entry is { checkpoint: CheckpointLabel; targetId: string; workspaceDelta: number } =>
+      entry.workspaceDelta !== undefined && checkpointMeetsMinimumJumpDistance(entry.checkpoint, currentWorkspacePercent))
+    .sort((left, right) => left.checkpoint.id - right.checkpoint.id);
 }
 
 function resolveCheckpointId(sm: SessionManager, id: number): string | undefined {
@@ -484,7 +516,7 @@ function loadAgentInstructions(): string {
 }
 
 const CONFIG_KEYS: (keyof Config)[] = [
-  "softThresholdPercent", "hardThresholdPercent", "workspaceReasoningBufferPercent", "softMessage",
+  "softThresholdPercent", "hardThresholdPercent", "workspaceReasoningBufferPercent", "minimumJumpDistance", "softMessage",
   "hardReasoningMessage", "hardNonReasoningMessage", "instructions",
   "advertiseVoluntaryCompaction", "afterTaskCompaction",
 ];
@@ -497,6 +529,9 @@ function validConfig(value: any): value is Config {
     && Number.isFinite(value.workspaceReasoningBufferPercent)
     && value.workspaceReasoningBufferPercent >= 0
     && value.workspaceReasoningBufferPercent <= 25
+    && Number.isFinite(value.minimumJumpDistance)
+    && value.minimumJumpDistance >= 0
+    && value.minimumJumpDistance <= 100
     && value.softThresholdPercent >= 0
     && value.softThresholdPercent < value.hardThresholdPercent
     && value.hardThresholdPercent <= 100
@@ -588,6 +623,7 @@ const SETTING_DESCRIPTIONS: Record<keyof Config, string> = {
   softThresholdPercent: "Soft warning threshold: when reached, the model receives an advisory to finish its current sub-task and preserve useful results in a checkpoint payload.",
   hardThresholdPercent: "Hard warning threshold: when context usage reaches this percentage, the model is urgently instructed to return to a checkpoint; reasoning models also receive a synthetic interruption.",
   workspaceReasoningBufferPercent: "Context reserved for reasoning while deciding whether a read or retrieved output fits in the available workspace. Range: 0-25%.",
+  minimumJumpDistance: "The minimum workspace utilization difference for a checkpoint jump to be valid when the target is above the soft threshold. Range: 0-100%.",
   softMessage: "Message sent to the model at the soft threshold. Use it to explain how the model should prepare before context becomes critical.",
   hardReasoningMessage: "Synthetic assistant message appended for reasoning models at the hard threshold to interrupt active reasoning and force checkpoint return.",
   hardNonReasoningMessage: "Urgent message sent to non-reasoning models at the hard threshold. It asks for immediate checkpoint return.",
@@ -803,6 +839,7 @@ export default function (pi: ExtensionAPI): void {
         ["softThresholdPercent", "Soft threshold"],
         ["hardThresholdPercent", "Hard threshold"],
         ["workspaceReasoningBufferPercent", "Workspace reasoning buffer"],
+        ["minimumJumpDistance", "Minimum jump distance"],
         ["softMessage", "Soft warning message"],
         ["hardReasoningMessage", "Hard reasoning-model message"],
         ["hardNonReasoningMessage", "Hard non-reasoning-model message"],
@@ -858,7 +895,7 @@ export default function (pi: ExtensionAPI): void {
           continue;
         }
 
-        if (key === "softThresholdPercent" || key === "hardThresholdPercent" || key === "workspaceReasoningBufferPercent") {
+        if (key === "softThresholdPercent" || key === "hardThresholdPercent" || key === "workspaceReasoningBufferPercent" || key === "minimumJumpDistance") {
           const value = await ctx.ui.editor(`Edit ${selected}\n\n${description}`, String(edited[key]));
           if (value == null) continue;
           const number = Number(value);
@@ -866,7 +903,9 @@ export default function (pi: ExtensionAPI): void {
           if (!Number.isFinite(number) || number < 0 || number > maximum) {
             ctx.ui.notify(key === "workspaceReasoningBufferPercent"
               ? "Workspace reasoning buffer must be between 0 and 25% in context."
-              : "Thresholds must be numbers between 0 and 100.", "error");
+              : key === "minimumJumpDistance"
+                ? "Minimum jump distance must be between 0 and 100%."
+                : "Thresholds must be numbers between 0 and 100.", "error");
           } else {
             edited[key] = number;
             editedKeys.add(key);
@@ -885,7 +924,7 @@ export default function (pi: ExtensionAPI): void {
       }
 
       if (!validConfig(edited)) {
-        ctx.ui.notify("Settings were not saved: check that the soft threshold is below the hard threshold and the workspace reasoning buffer is between 0 and 25%.", "error");
+        ctx.ui.notify("Settings were not saved: check that the soft threshold is below the hard threshold, the workspace reasoning buffer is between 0 and 25%, and the minimum jump distance is between 0 and 100%.", "error");
         return;
       }
       const scope = await ctx.ui.select("Apply voluntary compaction settings to", [
@@ -934,12 +973,26 @@ export default function (pi: ExtensionAPI): void {
   };
 
   const checkpointListForInterruption = (ctx: ExtensionContext): string => {
-    const checkpoints = listedCheckpointEntries(manager(ctx))
-      .sort((left, right) => left.checkpoint.id - right.checkpoint.id);
-    if (!checkpoints.length) return "(no checkpoints)";
-    return checkpoints.map(({ checkpoint }) => formatCheckpointLabel(checkpoint)).join("\n");
+    const currentWorkspacePercent = workspaceUsedPercent(ctx);
+    const checkpoints = eligibleJumpCheckpoints(manager(ctx), currentWorkspacePercent);
+    if (!checkpoints.length) return "(no checkpoints with sufficient workspace utilization difference)";
+    return checkpoints.map(({ checkpoint, workspaceDelta }) =>
+      formatCheckpointLabel(checkpoint, workspaceDelta)).join("\n");
   };
 
+  const invalidJumpTargetResult = (ctx: ExtensionContext) => {
+    if (ctx.hasUI) ctx.ui.notify("Checkpoint jump suppressed.", "warning");
+    return textResult(`This checkpoint is invalid target, because the workspace utilization delta is too low.\n\nAvailable checkpoints (use one of these IDs; do not call checkpoint_list):\n${checkpointListForInterruption(ctx)}`);
+  };
+
+  const jumpTargetMeetsMinimumDistance = (sm: SessionManager, targetId: number, ctx: ExtensionContext): boolean => {
+    const checkpoint = checkpointEntries(sm).find((entry) => entry.checkpoint.id === targetId)?.checkpoint;
+    if (!checkpoint) return false;
+    return checkpointMeetsMinimumJumpDistance(checkpoint, workspaceUsedPercent(ctx));
+  };
+
+  // Call only after the jump target and payload have passed validation. A
+  // rejected attempt must retain the hard-limit thinking level for its retry.
   const cancelHardInterruptionForJump = (): void => {
     const hadPendingHardInterruption = hardInterruptionPending || hardJumpPending;
     assistantBumpPending = false;
@@ -957,8 +1010,9 @@ export default function (pi: ExtensionAPI): void {
   const dispatchHardInterruption = (ctx: ExtensionContext): void => {
     if (!hardInterruptionPending) return;
     if (jumpPending || checkpointJumpCallInProgress) {
+      // Wait for the jump tool's distance validation. Only its accepted
+      // execution may clear hard pressure and restore the prior thinking level.
       logInterceptor("hard_interruption_suppressed_for_jump", pressureState());
-      cancelHardInterruptionForJump();
       return;
     }
     // A partial tool name is not enough to decide whether this is a jump.
@@ -1158,6 +1212,21 @@ ${checkpointListForInterruption(ctx)}`;
         const exceedsWorkspace = estimatedTokens > workspaceTokens;
         if (!exceedsWorkspace) {
           const text = await readReadFileFull(file, ctx.signal);
+          if (file.lineLimit !== undefined) {
+            const linesFromOffset = await countReadFileLinesFromOffset({ path: file.path, startLine: file.startLine }, ctx.signal);
+            const selectedLines = Math.min(file.lineLimit, linesFromOffset);
+            const remainingLines = linesFromOffset - selectedLines;
+            if (remainingLines > 0) {
+              const nextOffset = file.startLine + selectedLines + 1;
+              return {
+                content: [{
+                  type: "text" as const,
+                  text: appendBottomNotice(text, formatReadContinuationNotice(remainingLines, nextOffset)),
+                }],
+                details: {},
+              };
+            }
+          }
           return {
             content: [{ type: "text" as const, text }],
             details: {},
@@ -1290,7 +1359,6 @@ ${checkpointListForInterruption(ctx)}`;
     if (state !== "none") {
       checkpointJumpCallInProgress = state === "jump";
       checkpointJumpNamePending = state === "unknown";
-      if (state === "jump") cancelHardInterruptionForJump();
     }
     // Re-check usage during streaming, after observing the partial tool name.
     // This lets us steer ordinary reasoning/output immediately while shielding
@@ -1340,7 +1408,6 @@ ${checkpointListForInterruption(ctx)}`;
     if (CHECKPOINT_JUMP_TOOL_NAMES.includes(event.toolName as (typeof CHECKPOINT_JUMP_TOOL_NAMES)[number])) {
       checkpointJumpCallInProgress = true;
       checkpointJumpNamePending = false;
-      cancelHardInterruptionForJump();
     } else {
       checkpointJumpCallInProgress = false;
       checkpointJumpNamePending = false;
@@ -1399,7 +1466,6 @@ ${checkpointListForInterruption(ctx)}`;
     if (CHECKPOINT_JUMP_TOOL_NAMES.includes(event.toolName as (typeof CHECKPOINT_JUMP_TOOL_NAMES)[number])) {
       checkpointJumpCallInProgress = true;
       checkpointJumpNamePending = false;
-      cancelHardInterruptionForJump();
     }
     evaluatePressure(ctx);
     logInterceptor("tool_execution_start", {
@@ -1589,8 +1655,8 @@ ${checkpointListForInterruption(ctx)}`;
       ...readLoadoutOverride,
       name, label,
       description: "Creates a new checkpoint, so you can later jump back.",
-      promptSnippet: "Save a point in time; all your current knowledge and workspace state become part of the checkpoint; you may jump to it later by ID.",
-      promptGuidelines: ["Checkpoint locks-in your current memory but also your current workspace utilization; never jump to the same checkpoint you just created."],
+      promptSnippet: "Create a checkpoint, you can jump back to it after doing work. Checkpoint contains all your actions up to that point.",
+      promptGuidelines: ["Always create a checkpoint before large reads, series of bash commands or after clarifying an assignment."],
       parameters: createParams,
       execute: createCheckpoint,
     });
@@ -1607,11 +1673,10 @@ ${checkpointListForInterruption(ctx)}`;
     async execute(_id, params: Static<typeof listParams>, _signal, _update, ctx) {
       const sm = manager(ctx);
       const limit = Math.max(1, Math.floor(params.limit ?? 50));
-      const checkpoints = listedCheckpointEntries(sm)
-        .sort((left, right) => left.checkpoint.id - right.checkpoint.id)
-        .slice(-limit);
-      const lines = checkpoints.map(({ checkpoint }) => formatCheckpointLabel(checkpoint));
-      return textResult(lines.join("\n") || "(no checkpoints)");
+      const checkpoints = eligibleJumpCheckpoints(sm, workspaceUsedPercent(ctx)).slice(-limit);
+      const lines = checkpoints.map(({ checkpoint, workspaceDelta }) =>
+        formatCheckpointLabel(checkpoint, workspaceDelta));
+      return textResult(lines.join("\n") || "(no checkpoints with sufficient workspace utilization difference)");
     },
   });
 
@@ -1627,9 +1692,9 @@ ${checkpointListForInterruption(ctx)}`;
   pi.registerTool({
     ...readLoadoutOverride,
     name: "checkpoint_jump", label: "Jump to checkpoint",
-    description: "Jump to a numeric checkpoint and continue with the supplied payload.",
+    description: "Jump to a checkpoint and continue with the supplied payload.",
     promptSnippet: "Jump to a checkpoint after completing a unit of work; always include a relevant payload.",
-    //promptGuidelines: ["Include relevant facts, decisions, completed actions, side effects, unresolved issues, and the next action in the payload."],
+    promptGuidelines: ["Include relevant facts, decisions, completed actions, side effects, unresolved issues, and the next action in the payload."],
     parameters: jumpParams,
     renderCall(args, theme, context) { return renderJumpCall("checkpoint_jump", args, theme, context); },
     renderResult: renderJumpResult,
@@ -1637,15 +1702,17 @@ ${checkpointListForInterruption(ctx)}`;
       const sm = manager(ctx);
       const target = resolveCheckpointId(sm, params.target);
       if (!target) return textResult(`Checkpoint #${params.target} was not found. Use checkpoint_list to inspect available checkpoints.`);
+      // Keep hard-limit reasoning disabled until a target with enough workspace
+      // distance has been accepted.
+      if (!jumpTargetMeetsMinimumDistance(sm, params.target, ctx)) return invalidJumpTargetResult(ctx);
       // Validate before clearing hard-pressure flags so a rejected forced jump
-      // re-triggers on the next turn instead of silently losing state.
+      // keeps reasoning disabled until a suitable jump is accepted.
       const payloadError = jumpPayloadError(params.payload);
       if (payloadError) return textResult(payloadError);
       const jumpNotice = checkpointJumpNotice(sm, params.target);
       const leaf = sm.getLeafId();
       const autoResume = hardJumpPending || hardInterruptionCancelledForJump;
       if (leaf === target) {
-        if (autoResume) cancelHardInterruptionForJump();
         return textResult(params.target === 0 ? "Already at checkpoint." : `Already at checkpoint [${params.target}].`);
       }
       const taskCompleted = autoResume ? false : (params.task_completed ?? false);
@@ -1756,6 +1823,7 @@ ${checkpointListForInterruption(ctx)}`;
       const sm = manager(ctx);
       const target = resolveCheckpointId(sm, params.target);
       if (!target) return textResult(`Checkpoint #${params.target} was not found. Use checkpoint_list to inspect available checkpoints.`);
+      if (!jumpTargetMeetsMinimumDistance(sm, params.target, ctx)) return invalidJumpTargetResult(ctx);
       const payloadError = jumpPayloadError(params.payload);
       if (payloadError) return textResult(payloadError);
       if (sm.getLeafId() === target) return textResult(params.target === 0 ? "Already at checkpoint." : `Already at checkpoint [${params.target}].`);

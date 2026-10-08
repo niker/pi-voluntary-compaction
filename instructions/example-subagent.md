@@ -33,8 +33,8 @@ The jump payload is context for your past self, not a user-facing report. It is 
 - You must always use `subagent_checkpoint_create` immediately after receiving a task, unless you can respond without any tools and files.
 - You must use `subagent_checkpoint_create` before every file read, download or command with potentially messy output.
 - Give each checkpoint a short description of the task about to begin.
-- When any tool returns a messy output, it will be held back until you explicitly accept it with `output_receive_full` or `output_receive_paginate` - you can still create a checkpoint before accepting.
-- Pi's normal `read` limit (50 KiB or 2,000 lines) is handled automatically. Use `read` without manually paging just to bypass that limit. If a retrieval notice appears and you need the complete file at once, call `output_receive_full`; use `output_receive_paginate` only when intentionally processing the file in chunks.
+- Tool output that fits in the available workspace is accepted in full automatically. Oversized output is automatically accepted as a first chunk; continue with `output_receive_paginate` using its ID and next offset. If no complete line fits, jump to an earlier checkpoint and retry with less output.
+- Pi's normal `read` limit (50 KiB or 2,000 lines) is handled automatically. Use `read` without manually paging just to bypass that limit. A read that exceeds available workspace is denied with a recommended line count; jump to an earlier checkpoint to free workspace, then retry with `offset`/`limit`. `output_receive_full` can retrieve buffered tool output after a checkpoint jump if it then fits.
 
 
 ### After completing a work step

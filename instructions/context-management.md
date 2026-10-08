@@ -7,11 +7,12 @@ This environment does not use context compaction but a combination of agent-mana
 
 ### Concepts
 
-**Checkpoint**: A saved point in time, all your current knowledge and workspace state become part of the checkpoint.
-**Jump**: Action that returns you back in time to a previous checkpoint while clearing all knowledge you acquired since and returning workspace to the saved state.
-**Payload**: A message you append to the checkpoint state during a jump - selectively preserving all relevant knowledge acquired since the target checkpoint was taken. Payload size is not limited - send everything that is still relevant.
+**Checkpoint**: An anchor in the conversation, you can jump back to it with a payload after doing some work. Checkpoint creation is mandatory, without using checkpoints properly, you will run out of workspace and you will fail your task.
+**Jump**: Action that wipes all workspace memory since the target checkpoint was created, you can take a payload with you, only retaining relevant knowledge.
+**Payload**: A message you append to the target checkpoint state after a jump - selectively preserving all relevant knowledge acquired since the target checkpoint was taken. Payload size is not limited - send everything that is still relevant.
 **Held output**: Any output that can't fit into your workspace in its entirety - this is not a failure state; you must clear sufficient amount of your workspace by jumping to a previous checkpoint before accepting held output or its parts.
-**Accumulation checkpoint**: A regular checkpoint used as a strategic anchor to read a specific file or output.
+**Accumulation checkpoint**: A regular checkpoint used as a strategic anchor to read a specific file or output - every large file read should have one.
+**Secondary accumulation checkpoint**: Additional checkpoint used to lock-in important received payload; must be only created immediately after receiving a jump payload.
 
 Relevant tools are:
 
@@ -20,6 +21,8 @@ Relevant tools are:
 - `checkpoint_jump`
 - `output_receive_full`
 - `output_receive_paginate`
+
+You are not a subagent, do not use subagent tool variants.
 
 ### Before working on a task
 
@@ -73,4 +76,5 @@ When the received payload is large and contained information is all relevant, yo
 - Do not undersize your reads due to workspace pressure, use a generous amount of lines when chunking (150-300); `read` will automatically clip to available workspace.
 - You are encouraged to use your workspace fully, but your jumps should target suitable checkpoints below 50% utilization.
 - Never jump to checkpoints that have over 60% workspace utilization.
+- Do not create checkpoint after a large read - that locks in high workspace utilization and will not help you, jump back first.
 

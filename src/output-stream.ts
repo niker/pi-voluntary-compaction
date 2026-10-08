@@ -103,6 +103,34 @@ async function* selectedFileLines(file: ReadFileRange, signal?: AbortSignal): As
   }
 }
 
+/** Count selected source lines using the read tool's split("\n") semantics. */
+export async function countReadFileLinesFromOffset(file: ReadFileRange, signal?: AbortSignal): Promise<number> {
+  const stream = createReadStream(file.path, {
+    encoding: "utf8",
+    ...(signal ? { signal } : {}),
+  });
+  let line = 0;
+  let started = file.startLine <= 0;
+  let separators = 0;
+  try {
+    for await (const rawChunk of stream) {
+      for (const character of rawChunk as string) {
+        if (!started) {
+          if (character === "\n") {
+            line++;
+            if (line >= file.startLine) started = true;
+          }
+          continue;
+        }
+        if (character === "\n") separators++;
+      }
+    }
+  } finally {
+    stream.destroy();
+  }
+  return started ? separators + 1 : 0;
+}
+
 export async function estimateReadFileStats(
   file: ReadFileRange,
   signal?: AbortSignal,
