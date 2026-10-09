@@ -1,4 +1,4 @@
-import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readFileSync, unwatchFile, watchFile, writeFileSync, type Stats } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
@@ -498,17 +498,24 @@ function conversationAdvanced(branch: readonly SessionEntry[], leaf: string | nu
   return index < 0 || branch.slice(index + 1).some((entry) => !PASSIVE_ENTRIES.has(entry.type));
 }
 
+function configuredAutoCompaction(path: string): boolean | undefined {
+  try {
+    const settings = JSON.parse(readFileSync(path, "utf8"));
+    const enabled = settings?.compaction?.enabled;
+    return typeof enabled === "boolean" ? enabled : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 function autoCompactionEnabled(ctx: ExtensionContext): boolean {
-  const runtime = ctx as any;
-  return runtime.agentSession?.autoCompactionEnabled === true
-    || runtime.session?.agentSession?.autoCompactionEnabled === true
-    || runtime.session?.autoCompactionEnabled === true
-    || runtime.autoCompactionEnabled === true
-    || runtime.autoCompact === true
-    || runtime.settings?.autoCompactionEnabled === true
-    || runtime.settings?.autoCompact === true
-    || runtime.config?.autoCompactionEnabled === true
-    || runtime.config?.autoCompact === true;
+  const globalPath = join(homedir(), ".pi", "agent", "settings.json");
+  let enabled = configuredAutoCompaction(globalPath) ?? true;
+  if (ctx.isProjectTrusted()) {
+    const projectPath = join(ctx.cwd, ".pi", "settings.json");
+    enabled = configuredAutoCompaction(projectPath) ?? enabled;
+  }
+  return enabled;
 }
 
 function loadAgentInstructions(): string {
@@ -668,6 +675,40 @@ export default function (pi: ExtensionAPI): void {
   let interceptorLogPath: string | null = null;
   let interceptorLogSequence = 0;
   let streamUpdateCount = 0;
+  let lastAutoCompactionEnabled: boolean | null = null;
+  const autoCompactionWatchers: Array<{ path: string; listener: (current: Stats, previous: Stats) => void }> = [];
+
+  const stopAutoCompactionWatchers = (): void => {
+    for (const watcher of autoCompactionWatchers.splice(0)) {
+      unwatchFile(watcher.path, watcher.listener);
+    }
+  };
+
+  const checkAutoCompactionSetting = (ctx: ExtensionContext): void => {
+    const enabled = autoCompactionEnabled(ctx);
+    if (enabled === lastAutoCompactionEnabled) return;
+    lastAutoCompactionEnabled = enabled;
+    if (enabled && ctx.hasUI) {
+      ctx.ui.notify("pi-voluntary-compaction replaces built-in auto-compact; disable auto-compact to avoid competing compaction flows.", "warning");
+    }
+  };
+
+  const watchAutoCompactionSettings = (ctx: ExtensionContext): void => {
+    const paths = [join(homedir(), ".pi", "agent", "settings.json")];
+    if (ctx.isProjectTrusted()) paths.push(join(ctx.cwd, ".pi", "settings.json"));
+    for (const path of paths) {
+      const listener = (_current: Stats, _previous: Stats): void => {
+        try {
+          checkAutoCompactionSetting(ctx);
+        } catch {
+          // A context can become stale while switching sessions; the next
+          // session_start installs fresh settings watchers.
+        }
+      };
+      watchFile(path, { interval: 500, persistent: false }, listener);
+      autoCompactionWatchers.push({ path, listener });
+    }
+  };
 
   const logInterceptor = (hook: string, details: Record<string, unknown> = {}): void => {
     if (!interceptorLogPath) return;
@@ -1164,6 +1205,8 @@ ${checkpointListForInterruption(ctx)}`;
   };
 
   pi.on("session_start", (_event, ctx) => {
+    stopAutoCompactionWatchers();
+    lastAutoCompactionEnabled = null;
     loadSavedConfig(ctx);
     pendingToolOutputs.clear();
     clippedReads.clear();
@@ -1201,10 +1244,12 @@ ${checkpointListForInterruption(ctx)}`;
         interceptorLogPath = null;
       }
     }
-    if (autoCompactionEnabled(ctx) && ctx.hasUI) {
-      ctx.ui.notify("pi-voluntary-compaction replaces built-in auto-compact; disable auto-compact to avoid competing compaction flows.", "warning");
-    }
+    checkAutoCompactionSetting(ctx);
+    watchAutoCompactionSettings(ctx);
     evaluatePressure(ctx);
+  });
+  pi.on("session_shutdown", () => {
+    stopAutoCompactionWatchers();
   });
   pi.on("tool_result", async (event, ctx) => {
     // File-mutation results are concise status traces (for example, "Successfully
