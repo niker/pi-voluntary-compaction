@@ -1,8 +1,11 @@
 # pi-voluntary-compaction
 
+## TL;DR Benchmarks
+See [Benchmark report](rc-vc-bench.md)
+
 ## Architecture
 
-This PI extesion operates as a harness-level agent-controlled garbage-collection mechanism.
+This PI extension operates as a harness-level agent-controlled garbage-collection mechanism.
 
 This allows even small and medium models to perform long-running complex tasks on huge amounts of data with `zero context rot`, `no classic compaction` and using relatively `small context length`.
 
