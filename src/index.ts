@@ -1,7 +1,7 @@
 import { appendFileSync, existsSync, mkdirSync, readFileSync, unwatchFile, watchFile, writeFileSync, type Stats } from "node:fs";
 import { randomUUID } from "node:crypto";
 import { homedir } from "node:os";
-import { dirname, join } from "node:path";
+import { dirname, extname, join } from "node:path";
 import type { ExtensionAPI, ExtensionContext, SessionEntry, SessionManager } from "@earendil-works/pi-coding-agent";
 import { matchesKey, Text } from "@earendil-works/pi-tui";
 import { Type, type Message, type Static } from "@earendil-works/pi-ai";
@@ -33,6 +33,7 @@ const INTERNAL_TOOLS = new Set([
   "checkpoint_jump", "subagent_checkpoint_jump", "checkpoint_list",
 ]);
 const CHECKPOINT_JUMP_TOOL_NAMES = ["checkpoint_jump", "subagent_checkpoint_jump"] as const;
+const IMAGE_READ_EXTENSIONS = new Set([".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"]);
 const PASSIVE_ENTRIES = new Set(["custom", "label", "session_info", "model_change", "thinking_level_change"]);
 
 type CheckpointJumpStreamState = "jump" | "unknown" | "other" | "none";
@@ -77,6 +78,14 @@ function jumpPayloadError(payload: string): string | undefined {
   return undefined;
 }
 const payloadResult = (text: string, payload: string) => ({ content: [{ type: "text" as const, text }], details: { payload } });
+
+function isImageReadPath(input: string, cwd: string): boolean {
+  try {
+    return IMAGE_READ_EXTENSIONS.has(extname(resolveReadSourcePath(input, cwd)).toLowerCase());
+  } catch {
+    return IMAGE_READ_EXTENSIONS.has(extname(input).toLowerCase());
+  }
+}
 
 function estimateTextTokens(text: string): number {
   return estimateTokensSafe(text);
@@ -1252,6 +1261,12 @@ ${checkpointListForInterruption(ctx)}`;
     stopAutoCompactionWatchers();
   });
   pi.on("tool_result", async (event, ctx) => {
+    // Preserve native image attachments. The text read preflight/reopen path
+    // would otherwise treat binary image bytes as lines and can replace the
+    // image result with decoded text when it decides the file is oversized.
+    const imageReadInput = event.toolName === "read" ? event.input as { path?: unknown } : undefined;
+    if (typeof imageReadInput?.path === "string" && isImageReadPath(imageReadInput.path, ctx.cwd)) return;
+
     // File-mutation results are concise status traces (for example, "Successfully
     // wrote to ..."). Preserve them even at zero workspace so the agent can
     // distinguish a successful write/edit from an actual tool failure.
@@ -1534,7 +1549,7 @@ ${checkpointListForInterruption(ctx)}`;
 
     if (event.toolName !== "read") return;
     const readInput = event.input as { path?: unknown; offset?: unknown; limit?: unknown };
-    if (typeof readInput.path !== "string") return;
+    if (typeof readInput.path !== "string" || isImageReadPath(readInput.path, ctx.cwd)) return;
     try {
       const file: ReadFileRange = {
         path: resolveReadSourcePath(readInput.path, ctx.cwd),

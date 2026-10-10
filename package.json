@@ -1,6 +1,6 @@
 {
   "name": "pi-voluntary-compaction",
-  "version": "1.0.6",
+  "version": "1.0.7",
   "description": "Voluntary agent-driven context compaction suite for Pi harness",
   "license": "Apache-2.0",
   "repository": {
