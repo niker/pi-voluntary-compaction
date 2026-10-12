@@ -1,11 +1,8 @@
 # pi-voluntary-compaction
 
-## TL;DR Benchmarks
-See [Benchmark report](rc-vc-bench.md)
-
 ## Architecture
 
-This PI extension operates as a harness-level agent-controlled garbage-collection mechanism.
+This PI extesion operates as a harness-level agent-controlled garbage-collection mechanism.
 
 This allows even small and medium models to perform long-running complex tasks on huge amounts of data with `zero context rot`, `no classic compaction` and using relatively `small context length`.
 
@@ -28,8 +25,8 @@ The strategy to prevent cumulative context degradation across multi-stage tasks:
 3. Upon task completion or a milestone, the agent decides what information is still relevant or needed to complete the task and prepares a minimal payload that it sends itself into the past via `checkpoint_jump`.
 4. The harness prunes all conversation between the checkpoint and current state, then hands the payload back to the agent to continue work.
 
- - 5a. The agent resumes work with all the necessary context and a plan. At worst it needs to re-read some files before edits.
- - 5b. If the agent jumped with information that the task is completed, control is given back to the user and waits for input. The user is presented with an option to `deny` the jump and continue the conversation without compaction - this is good for many simple low-latency tasks but not strictly necessary as the payload usually carries enough information to perform repeated tasks seamlessly. 
+- 5a. The agent resumes work with all the necessary context and a plan. At worst it needs to re-read some files before edits.
+- 5b. If the agent jumped with information that the task is completed, control is given back to the user and waits for input. The user is presented with an option to `deny` the jump and continue the conversation without compaction - this is good for many simple low-latency tasks but not strictly necessary as the payload usually carries enough information to perform repeated tasks seamlessly. 
    
 This strategy maintains optimal attention performance and low context utilization without losing high-level task focus.
 
@@ -38,7 +35,7 @@ This strategy maintains optimal attention performance and low context utilizatio
 
 This layer effectively prevents the model from choking itself on massive console output or website and allows it to seamlessly read files beyond the usual 2000-line/50kb limit of PI.
 
-Tool output is intercepted before it enters the model's context when it exceeds the dynamic workspace (context remaining after the hard-threshold reserve and workspace reasoning buffer). For `read`, the harness accepts full file contents when they fit, including contents beyond Pi's usual 2,000-line/50 KB read limit. If a read will not fit, it is denied with a recommended line count; jump to an earlier checkpoint to free workspace, then retry with `offset`/`limit`. For other tools, output that fits is accepted in full; oversized output is accepted as a first line-based chunk sized for the available workspace. Continue with `output_receive_paginate`, or use `output_receive_full` after freeing workspace if the complete output will then fit. If no complete line fits, the output is denied with guidance to jump to an earlier checkpoint and retry with less output. Interception is informational and does not itself trigger a checkpoint interruption.
+Tool output is intercepted before it enters the model's context when it exceeds the dynamic workspace (context remaining after the hard-threshold reserve and workspace reasoning buffer) or the configured maximum tool-output size (default 8,000 estimated tokens). `read` is governed only by workspace fit. Checkpointing and pagination tools are not subject to the size limit. For `read`, the harness accepts full file contents when they fit, including contents beyond Pi's usual 2,000-line/50 KB read limit. If a read will not fit, it is denied with a recommended line count; jump to an earlier checkpoint to free workspace, then retry with `offset`/`limit`. Other oversized output is accepted as a first line-based chunk sized to fit both the available workspace and configured output limit. Continue with `output_receive_paginate`, or use `output_receive_full` after freeing workspace if the complete output will then fit. If no complete line fits, the output is denied with guidance to reduce the output or increase the available budget. Interception is informational and does not itself trigger a checkpoint interruption.
 
 
 ## Agent tools
@@ -75,6 +72,7 @@ Agents can freely create a checkpoint between a tool call and output_receive, bu
 You can configure pretty much everything important:
 - soft/hard context utilization limits
 - workspace reasoning buffer for automatic read/output retrieval sizing (default 5%, range 0-25%)
+- maximum estimated size for non-read tool output before pagination (default 8,000 tokens)
 - minimum workspace-utilization difference required for a checkpoint jump (default 7.5%)
 - soft/hard limit messages that steer the agent
 - built-in injected system prompt that teaches agent voluntary compaction

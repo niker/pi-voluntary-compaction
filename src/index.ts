@@ -167,12 +167,20 @@ function countOutputLinesWithinBudget(output: BufferedToolOutput, offset: number
   return countLinesWithinTokenBudget(contentText(output.content), offset, tokenBudget);
 }
 
-function formatOutputPage(pageText: string, id: number, offset: number, pageLines: number, totalLines: number): string {
+function formatOutputPage(
+  pageText: string,
+  id: number,
+  offset: number,
+  pageLines: number,
+  totalLines: number,
+  pageNotice?: string,
+): string {
   const nextOffset = offset + pageLines;
   const continuation = nextOffset > totalLines
-    ? "[This was the last page.]"
-    : `[To continue, call 'output_receive_paginate' with id ${id}, offset ${nextOffset} and a suitable limit.]`;
-  return appendBottomNotice(pageText, continuation);
+    ? "This was the last page."
+    : `To continue, call 'output_receive_paginate' with id ${id}, offset ${nextOffset} and a suitable limit.`;
+  const notice = pageNotice ? `[${pageNotice}. ${continuation}]` : `[${continuation}]`;
+  return appendBottomNotice(pageText, notice);
 }
 
 function outputPageWithinBudget(
@@ -180,12 +188,13 @@ function outputPageWithinBudget(
   id: number,
   offset: number,
   tokenBudget: number,
+  pageNotice?: (lineCount: number) => string,
 ): { text: string; lineCount: number } | null {
   const remainingLines = Math.max(0, output.lineCount - offset + 1);
   const maxLines = Math.min(remainingLines, countOutputLinesWithinBudget(output, offset, tokenBudget));
   for (let lineCount = maxLines; lineCount > 0; lineCount--) {
     const pageText = paginateContentByLines(output.content, offset, lineCount);
-    const text = formatOutputPage(pageText, id, offset, lineCount, output.lineCount);
+    const text = formatOutputPage(pageText, id, offset, lineCount, output.lineCount, pageNotice?.(lineCount));
     if (estimateTextTokens(text) <= tokenBudget) return { text, lineCount };
   }
   return null;
@@ -540,7 +549,7 @@ function loadAgentInstructions(): string {
 }
 
 const CONFIG_KEYS: (keyof Config)[] = [
-  "softThresholdPercent", "hardThresholdPercent", "workspaceReasoningBufferPercent", "minimumJumpDistance", "softMessage",
+  "softThresholdPercent", "hardThresholdPercent", "workspaceReasoningBufferPercent", "maxToolOutputTokens", "minimumJumpDistance", "softMessage",
   "hardReasoningMessage", "hardNonReasoningMessage", "instructions",
   "advertiseVoluntaryCompaction", "afterTaskCompaction",
 ];
@@ -553,6 +562,8 @@ function validConfig(value: any): value is Config {
     && Number.isFinite(value.workspaceReasoningBufferPercent)
     && value.workspaceReasoningBufferPercent >= 0
     && value.workspaceReasoningBufferPercent <= 25
+    && Number.isSafeInteger(value.maxToolOutputTokens)
+    && value.maxToolOutputTokens >= 1
     && Number.isFinite(value.minimumJumpDistance)
     && value.minimumJumpDistance >= 0
     && value.minimumJumpDistance <= 100
@@ -574,6 +585,7 @@ function validOverrides(value: any): value is ConfigOverrides {
     const item = value[key];
     if (key === "instructions") return item === null || typeof item === "string";
     if (key === "workspaceReasoningBufferPercent") return typeof item === "number" && Number.isFinite(item) && item >= 0 && item <= 25;
+    if (key === "maxToolOutputTokens") return typeof item === "number" && Number.isSafeInteger(item) && item >= 1;
     if (key === "advertiseVoluntaryCompaction") return typeof item === "boolean";
     if (key === "afterTaskCompaction") return item === "denied" || item === "allowed";
     if (key.endsWith("Message")) return typeof item === "string";
@@ -647,6 +659,7 @@ const SETTING_DESCRIPTIONS: Record<keyof Config, string> = {
   softThresholdPercent: "Soft warning threshold: when reached, the model receives an advisory to finish its current sub-task and preserve useful results in a checkpoint payload.",
   hardThresholdPercent: "Hard warning threshold: when context usage reaches this percentage, the model is urgently instructed to return to a checkpoint; reasoning models also receive a synthetic interruption.",
   workspaceReasoningBufferPercent: "Context reserved for reasoning while deciding whether a read or retrieved output fits in the available workspace. Range: 0-25%.",
+  maxToolOutputTokens: "Maximum estimated token size for a single non-read tool output before it is paginated. Checkpoint and pagination tools are excluded.",
   minimumJumpDistance: "The minimum workspace utilization difference for a checkpoint jump to be valid when the target is above the soft threshold. Range: 0-100%.",
   softMessage: "Message sent to the model at the soft threshold. Use it to explain how the model should prepare before context becomes critical.",
   hardReasoningMessage: "Synthetic assistant message appended for reasoning models at the hard threshold to interrupt active reasoning and force checkpoint return.",
@@ -899,6 +912,7 @@ export default function (pi: ExtensionAPI): void {
         ["softThresholdPercent", "Soft threshold"],
         ["hardThresholdPercent", "Hard threshold"],
         ["workspaceReasoningBufferPercent", "Workspace reasoning buffer"],
+        ["maxToolOutputTokens", "Maximum tool output size"],
         ["minimumJumpDistance", "Minimum jump distance"],
         ["softMessage", "Soft warning message"],
         ["hardReasoningMessage", "Hard reasoning-model message"],
@@ -955,17 +969,20 @@ export default function (pi: ExtensionAPI): void {
           continue;
         }
 
-        if (key === "softThresholdPercent" || key === "hardThresholdPercent" || key === "workspaceReasoningBufferPercent" || key === "minimumJumpDistance") {
+        if (key === "softThresholdPercent" || key === "hardThresholdPercent" || key === "workspaceReasoningBufferPercent" || key === "maxToolOutputTokens" || key === "minimumJumpDistance") {
           const value = await ctx.ui.editor(`Edit ${selected}\n\n${description}`, String(edited[key]));
           if (value == null) continue;
           const number = Number(value);
           const maximum = key === "workspaceReasoningBufferPercent" ? 25 : 100;
-          if (!Number.isFinite(number) || number < 0 || number > maximum) {
+          const invalidMaxToolOutput = key === "maxToolOutputTokens" && (!Number.isSafeInteger(number) || number < 1);
+          if (invalidMaxToolOutput || !Number.isFinite(number) || (key !== "maxToolOutputTokens" && (number < 0 || number > maximum))) {
             ctx.ui.notify(key === "workspaceReasoningBufferPercent"
               ? "Workspace reasoning buffer must be between 0 and 25% in context."
               : key === "minimumJumpDistance"
                 ? "Minimum jump distance must be between 0 and 100%."
-                : "Thresholds must be numbers between 0 and 100.", "error");
+                : key === "maxToolOutputTokens"
+                  ? "Maximum tool output size must be a positive whole number of tokens."
+                  : "Thresholds must be numbers between 0 and 100.", "error");
           } else {
             edited[key] = number;
             editedKeys.add(key);
@@ -984,7 +1001,7 @@ export default function (pi: ExtensionAPI): void {
       }
 
       if (!validConfig(edited)) {
-        ctx.ui.notify("Settings were not saved: check that the soft threshold is below the hard threshold, the workspace reasoning buffer is between 0 and 25%, and the minimum jump distance is between 0 and 100%.", "error");
+        ctx.ui.notify("Settings were not saved: check the thresholds, workspace reasoning buffer, maximum tool output size, and minimum jump distance.", "error");
         return;
       }
       const scope = await ctx.ui.select("Apply voluntary compaction settings to", [
@@ -1267,11 +1284,9 @@ ${checkpointListForInterruption(ctx)}`;
     const imageReadInput = event.toolName === "read" ? event.input as { path?: unknown } : undefined;
     if (typeof imageReadInput?.path === "string" && isImageReadPath(imageReadInput.path, ctx.cwd)) return;
 
-    // File-mutation results are concise status traces (for example, "Successfully
-    // wrote to ..."). Preserve them even at zero workspace so the agent can
-    // distinguish a successful write/edit from an actual tool failure.
-    if (event.toolName === "write" || event.toolName === "edit"
-      || event.toolName.startsWith("output_receive_")
+    // Keep VC's own checkpoint and pagination results out of the interceptor;
+    // apply the output-size limit to every other non-read tool.
+    if (event.toolName.startsWith("output_receive_")
       || event.toolName.startsWith("checkpoint_")
       || event.toolName.startsWith("subagent_checkpoint_")) return;
 
@@ -1374,7 +1389,8 @@ ${checkpointListForInterruption(ctx)}`;
         details: {},
       };
     }
-    if (workspaceTokens === null || !exceedsWorkspace) return;
+    const exceedsConfiguredLimit = estimatedTokens > config.maxToolOutputTokens;
+    if (!exceedsWorkspace && !exceedsConfiguredLimit) return;
 
     const id = nextToolOutputId++;
     const bufferedContent = event.content.map((part: any) => part.type === "text" ? { ...part } : part);
@@ -1386,18 +1402,23 @@ ${checkpointListForInterruption(ctx)}`;
       estimatedTokens,
       lineCount,
     };
-    const firstPage = outputPageWithinBudget(output, id, 1, Math.max(0, workspaceTokens));
+    const pageBudget = workspaceTokens === null
+      ? config.maxToolOutputTokens
+      : Math.min(Math.max(0, workspaceTokens), config.maxToolOutputTokens);
+    pendingToolOutputs.set(id, output);
+    const pageNotice = (pageLines: number) =>
+      `Large tool output was paginated; showing lines 1-${pageLines} of ${lineCount}`;
+    const firstPage = outputPageWithinBudget(output, id, 1, pageBudget, pageNotice);
     if (!firstPage) {
       return {
         content: [{
           type: "text" as const,
-          text: "Tool output is too large for available workspace, only 0 lines would fit. To free more workspace and read bigger chunks, jump to an earlier checkpoint before trying again.",
+          text: `[Tool output is about ${estimatedTokens} tokens; no complete line fits within the current ${pageBudget}-token budget. Output is retained as ID ${id}. Jump to an earlier checkpoint, then call 'output_receive_paginate' with id ${id}, offset 1 and no limit.]`,
         }],
-        details: {},
+        details: { outputId: id, totalLines: lineCount },
       };
     }
 
-    pendingToolOutputs.set(id, output);
     const content: any[] = [];
     let textInserted = false;
     for (const part of event.content) {

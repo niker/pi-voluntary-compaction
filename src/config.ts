@@ -3,6 +3,7 @@ export type Config = {
   softThresholdPercent: number;
   hardThresholdPercent: number;
   workspaceReasoningBufferPercent: number;
+  maxToolOutputTokens: number;
   minimumJumpDistance: number;
   softMessage: string;
   hardReasoningMessage: string;
@@ -19,6 +20,7 @@ export const DEFAULT_CONFIG: Config = {
   softThresholdPercent: 65,
   hardThresholdPercent: 80,
   workspaceReasoningBufferPercent: 5,
+  maxToolOutputTokens: 8000,
   minimumJumpDistance: 7.5,
   softMessage: [
     "[CHECKPOINT JUMP RECOMMENDED]",
