@@ -53,7 +53,7 @@ Mean wall time is 4,099.2 s for RC and 2,381.7 s for VC, about **41.9% lower for
 ## 5. Compaction outcomes
 
 | Run | Recorded events | Summary and resume boundary recorded | Compaction failures (truncation) | Tool-result errors |
-|---|---:|---:|---|---:|---:|---:|
+|---|---:|---:|---|---:|
 | RC1 | 16 | 16 | 1 (#6) | 1 Bash |
 | RC2 | 20 | 20 | 4 (#6, #15, #19, #20) | 0 |
 | RC3 | 13 | 13 | 0 | 10 Bash |
