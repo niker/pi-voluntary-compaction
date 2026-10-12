@@ -1,5 +1,23 @@
 # pi-voluntary-compaction
 
+## TL;DR
+
+Use one agent for a project - indefinitely. No handoff, no compaction.
+
+Example - a RE job I have running now for about a day.
+Notice the tokens in/out and context utilization:
+
+<img width="785" height="286" alt="obrazek" src="https://github.com/user-attachments/assets/b3ffd9f8-27bc-43fb-af84-45736d43f13f" />
+
+
+Here are results of a large book extraction benchmark that compares the same run on regular compaction and voluntary compaction:
+
+[Comparison Benchmark](./rc-vc-bench.md)
+
+Other benchmarks and judgements are up to you. Feel free to drop a line here on github.
+
+---
+
 ## Architecture
 
 This PI extesion operates as a harness-level agent-controlled garbage-collection mechanism.
