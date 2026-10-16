@@ -218,6 +218,86 @@ function renderJumpResult(result: any, _options: { expanded: boolean }, _theme: 
   return new Text(text, 0, 0);
 }
 
+// Retrieval results are the page content itself, so the generic TUI fallback
+// would print raw page lines (or one wrapped single-line blob) on every call.
+// Render a one-line summary collapsed and the page only when expanded.
+type ReceivePageDetails = {
+  outputId?: unknown;
+  offset?: unknown;
+  limit?: unknown;
+  totalLines?: unknown;
+  nextOffset?: unknown;
+};
+type ReceiveFullDetails = { outputReceive?: { outputId?: unknown; totalLines?: unknown } };
+
+function finiteInt(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) ? Math.floor(value) : undefined;
+}
+
+function resultText(content: readonly any[]): string {
+  return content.filter((part: any) => part?.type === "text").map((part: any) => part.text).join("\n");
+}
+
+function resultImageCount(content: readonly any[]): number {
+  return content.filter((part: any) => part?.type === "image").length;
+}
+
+function renderReceiveCall(toolName: string, args: any, theme: any): Text {
+  const title = theme.fg("toolTitle", theme.bold(`${toolName} `));
+  const id = finiteInt(args?.id);
+  const idText = id === undefined ? theme.fg("muted", "#?") : theme.fg("accent", `#${id}`);
+  const offset = finiteInt(args?.offset);
+  const limit = finiteInt(args?.limit);
+  const range = offset === undefined ? ""
+    : theme.fg("muted", limit === undefined ? ` lines ${offset}+` : ` lines ${offset}-${offset + limit - 1}`);
+  return new Text(`${title}${idText}${range}`, 0, 0);
+}
+
+function renderReceiveFullResult(result: any, options: { expanded: boolean }, theme: any): Text {
+  const content = Array.isArray(result?.content) ? result.content : [];
+  const text = resultText(content);
+  if (options.expanded) return new Text(text, 0, 0);
+  const details = result?.details as ReceiveFullDetails | undefined;
+  const outputId = finiteInt(details?.outputReceive?.outputId);
+  // No retrieval metadata means this is a rejection or error message, which is
+  // short and must stay visible collapsed.
+  if (outputId === undefined) return new Text(text, 0, 0);
+  const totalLines = finiteInt(details?.outputReceive?.totalLines);
+  const images = resultImageCount(content);
+  const parts = [totalLines === undefined ? "full output" : `${totalLines} line${totalLines === 1 ? "" : "s"}`];
+  if (images > 0) parts.push(`${images} image${images === 1 ? "" : "s"}`);
+  const summary = `Received full output #${outputId} (${parts.join(", ")})`;
+  return new Text(theme.fg("muted", summary), 0, 0);
+}
+
+function renderReceivePageResult(result: any, options: { expanded: boolean }, theme: any): Text {
+  const content = Array.isArray(result?.content) ? result.content : [];
+  const text = resultText(content);
+  if (options.expanded) return new Text(text, 0, 0);
+  const details = result?.details as ReceivePageDetails | undefined;
+  const outputId = finiteInt(details?.outputId);
+  const offset = finiteInt(details?.offset);
+  const limit = finiteInt(details?.limit);
+  const totalLines = finiteInt(details?.totalLines);
+  const nextOffset = finiteInt(details?.nextOffset);
+  if (outputId === undefined || offset === undefined || limit === undefined) {
+    return new Text(text, 0, 0);
+  }
+  const lastLine = offset + Math.max(1, limit) - 1;
+  const totals = totalLines === undefined ? "" : ` of ${totalLines}`;
+  const continuation = totalLines === undefined || nextOffset === undefined ? ""
+    : nextOffset > totalLines ? "; final page" : `; next offset ${nextOffset}`;
+  const summary = `Received lines ${offset}-${lastLine}${totals} (output #${outputId}${continuation})`;
+  return new Text(theme.fg("muted", summary), 0, 0);
+}
+
+function withReceiveFullDetails(details: unknown, outputId: number, totalLines: number): unknown {
+  const base = details && typeof details === "object" && !Array.isArray(details)
+    ? details as Record<string, unknown>
+    : {};
+  return { ...base, outputReceive: { outputId, totalLines } };
+}
+
 function usagePercent(ctx: ExtensionContext): number | null {
   const usage = ctx.getContextUsage();
   if (!usage) return null;
@@ -1880,6 +1960,8 @@ ${checkpointListForInterruption(ctx)}`;
     name: "output_receive_full", label: "Receive full tool output",
     description: "Accept the complete large output, assuming it fits in your available workspace.",
     parameters: receiveFullParams,
+    renderCall(args, theme) { return renderReceiveCall("output_receive_full", args, theme); },
+    renderResult: renderReceiveFullResult,
     async execute(_toolCallId, params: Static<typeof receiveFullParams>, _signal, _update, ctx) {
       const output = pendingToolOutputs.get(params.id);
       if (!output) return textResult(`Requested output ID ${params.id} was not found.`);
@@ -1894,7 +1976,7 @@ ${checkpointListForInterruption(ctx)}`;
         }
         return textResult(`Full output was not accepted because it does not fit in the available workspace. Retrieve output ID ${params.id} using output_receive_paginate with offset 1 and limit ${recommendedPage.lineCount}.`);
       }
-      return { content: output.content, details: output.details };
+      return { content: output.content, details: withReceiveFullDetails(output.details, params.id, output.lineCount) };
     },
   });
 
@@ -1908,6 +1990,8 @@ ${checkpointListForInterruption(ctx)}`;
     name: "output_receive_paginate", label: "Paginate tool output",
     description: "Accept a page of large output using a line-based offset and optional limit. If limit is omitted, automatically choose a page size that fits the current workspace. Use successive offsets and checkpoint_jump to process large outputs incrementally.",
     parameters: receivePaginateParams,
+    renderCall(args, theme) { return renderReceiveCall("output_receive_paginate", args, theme); },
+    renderResult: renderReceivePageResult,
     async execute(_toolCallId, params: Static<typeof receivePaginateParams>, _signal, _update, ctx) {
       const output = pendingToolOutputs.get(params.id);
       if (!output) return textResult(`Requested output ID ${params.id} was not found.`);
