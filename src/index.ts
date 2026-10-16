@@ -16,6 +16,7 @@ import {
   resolveReadSourcePath,
   type ReadFileRange,
 } from "./output-stream.js";
+import { createUnlimitedBashToolDefinition } from "./unlimited-bash.js";
 
 type PendingJump = { target: string; checkpointId: number; payload: string; taskCompleted: boolean; subagent: boolean; autoResume: boolean };
 type PendingJumpOffer = { target: string; checkpointId: number; payload: string; allowed: boolean };
@@ -2067,6 +2068,11 @@ ${checkpointListForInterruption(ctx)}`;
         : `Checkpoint jump to [${params.target}] is pending while this subagent completes; payload retained.`, params.payload);
     },
   });
+
+  // Replace Pi's built-in bash tool. The built-in returns only the last 2,000
+  // lines / 50 KB and names a temp file for the rest; voluntary compaction
+  // accepts the complete output and paginates it against the live workspace.
+  pi.registerTool(createUnlimitedBashToolDefinition(process.cwd()));
 
   pi.on("agent_end", (_event, ctx) => {
     const request = pendingJump;
