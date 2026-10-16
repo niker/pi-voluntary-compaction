@@ -4,17 +4,29 @@
 
 Use one agent for a project - indefinitely. No handoff, no compaction.
 
-Example - a RE job I have running now for about a day.
+Features:
+- One agent for a job, effectively unlimited context from users' point of view.
+- No compaction - agent only keeps what is currently relevant in context.
+- Ability to forget - agent can be ordered to forget information; hallucinations or wrong assumptions can be stripped from context (jump to #X and omit Y)
+- Near impossible to context choke - very large reads or tool output cannot kill the agent.
+- Higher workspace ceiling - for low context windows you can specify a hard size limit above the usual 75%. Default is 80% but up to 90% may be viable.
+- Unlimited file read sizes and tool output - PI's innate 50kb/2000lines limits are removed, agent can simply paginate over both as needed.
+- Low context windows are now viable - I prefer 72k as the sweet spot but lower would still be usable.
+- Safe multi-day workflows, see image below.
+
+
+Example - a RE job I have running now for about 3 days on Qwen (half at 27b via lm studio, half flash via strata).
 Notice the tokens in/out and context utilization:
 
-<img width="785" height="286" alt="obrazek" src="https://github.com/user-attachments/assets/b3ffd9f8-27bc-43fb-af84-45736d43f13f" />
+<img width="727" height="234" alt="obrazek" src="https://github.com/user-attachments/assets/ebeb4982-a8ea-4038-a79f-918742010c32" />
+
 
 
 Here are results of a large book extraction benchmark that compares the same run on regular compaction and voluntary compaction:
 
 [Comparison Benchmark](./rc-vc-bench.md)
 
-Other benchmarks and judgements are up to you. Feel free to drop a line here on github.
+Other benchmarks and judgements are up to you. Feel free to drop a line with your findings here on github.
 
 ---
 
