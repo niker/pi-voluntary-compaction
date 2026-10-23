@@ -35,6 +35,7 @@ const INTERNAL_TOOLS = new Set([
 ]);
 const CHECKPOINT_JUMP_TOOL_NAMES = ["checkpoint_jump", "subagent_checkpoint_jump"] as const;
 const IMAGE_READ_EXTENSIONS = new Set([".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"]);
+const SMALL_TOOL_OUTPUT_MAX_CHARS = 500;
 const PASSIVE_ENTRIES = new Set(["custom", "label", "session_info", "model_change", "thinking_level_change"]);
 
 type CheckpointJumpStreamState = "jump" | "unknown" | "other" | "none";
@@ -102,6 +103,18 @@ function contentText(content: readonly any[]): string {
     .filter((part) => part?.type === "text" && typeof part.text === "string")
     .map((part) => part.text as string)
     .join("");
+}
+
+function isSmallSingleLineToolOutput(content: readonly any[]): boolean {
+  // Only exempt plain-text statuses; preserve the size guard for image or other
+  // non-text payloads even if their accompanying text is short.
+  if (!content.every((part) => part?.type === "text" && typeof part.text === "string")) return false;
+  const text = content.map((part) => part.text as string).join("");
+  if (text.length > SMALL_TOOL_OUTPUT_MAX_CHARS) return false;
+
+  const lines = text.split(/\r\n|[\r\n\u2028\u2029]/);
+  if (lines[lines.length - 1] === "") lines.pop();
+  return lines.length <= 1;
 }
 
 function formatClippedReadNotice(read: ClippedRead): string {
@@ -1365,8 +1378,7 @@ ${checkpointListForInterruption(ctx)}`;
     const imageReadInput = event.toolName === "read" ? event.input as { path?: unknown } : undefined;
     if (typeof imageReadInput?.path === "string" && isImageReadPath(imageReadInput.path, ctx.cwd)) return;
 
-    // Keep VC's own checkpoint and pagination results out of the interceptor;
-    // apply the output-size limit to every other non-read tool.
+    // Keep VC's own checkpoint and pagination results out of the interceptor.
     if (event.toolName.startsWith("output_receive_")
       || event.toolName.startsWith("checkpoint_")
       || event.toolName.startsWith("subagent_checkpoint_")) return;
@@ -1472,6 +1484,7 @@ ${checkpointListForInterruption(ctx)}`;
     }
     const exceedsConfiguredLimit = estimatedTokens > config.maxToolOutputTokens;
     if (!exceedsWorkspace && !exceedsConfiguredLimit) return;
+    if (isSmallSingleLineToolOutput(resultContent)) return;
 
     const id = nextToolOutputId++;
     const bufferedContent = event.content.map((part: any) => part.type === "text" ? { ...part } : part);
@@ -1906,7 +1919,7 @@ ${checkpointListForInterruption(ctx)}`;
   });
 
   const jumpParams = Type.Object({
-    target: Type.Number({ multipleOf: 1, description: "Numeric checkpoint ID returned by checkpoint_create or shown by checkpoint_list." }),
+    target: Type.Number({ multipleOf: 1, description: "Numeric checkpoint ID returned by checkpoint_create or shown by checkpoint_list; must always be the first parameter before payload." }),
     payload: Type.String({ description: "Payload that meticulously preserves all relevant knowledge acquired since the target checkpoint and includes planned next steps." }),
     task_completed: Type.Optional(Type.Boolean({ description: "Use true only after you already reported task completion to the user." })),
   });

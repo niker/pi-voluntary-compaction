@@ -32,6 +32,8 @@ You must always create a fresh new checkpoint:
 - immediately before every curl call or website download
 - immediately after receiving a jump payload - to lock-in the payload
 
+Always prefer to use MCP tools in code mode if available, especially when searching or listing tools.
+
 
 ## Processing of large files and outputs
 
@@ -77,6 +79,6 @@ When the received payload is large and contained information is all relevant, yo
 - Lock-in the knowledge in just-received jump payload permanently by creating a new checkpoint.
 - The only way to free workspace is to jump back to an earlier checkpoint that had cleaner workspace.
 - Do not be conservative when sizing file `read` chunks regardless of workspace use, use a generous amount of lines when chunking (150-300); trust the guidance notices provided after using tools.
-- Your jumps should target suitable checkpoints below 50% utilization, but try to select checkpoints with most locked-in payloads.
+- Your jumps should target suitable checkpoints below 40% utilization, but try to select checkpoints with most locked-in payloads.
 - Creating a checkpoint after a large read without jumping first makes no sense.
 
