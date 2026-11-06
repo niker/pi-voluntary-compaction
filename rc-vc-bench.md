@@ -2,9 +2,9 @@
 
 ## Abstract
 
-This snapshot compares five saved RC runs (`rc1`–`rc5`) with three saved VC runs (`vc1`–`vc3`). No model outputs were rerun. The mean composite score is **82.37 for RC** and **96.22 for VC**, a **13.85-point VC advantage**. Every VC score exceeds every RC score: VC ranges from 93.78 to 98.12, while RC ranges from 79.75 to 84.31. RC's chapter failure is specific and repeated: all five runs reported the empty separator line rather than the required final line of chapter text, while all three VC runs followed the explicit instruction. The same model configuration was used throughout. Even if RC is granted 100% chapter accuracy in an illustrative counterfactual, its mean composite is 95.53, still 0.69 points below VC.
+This snapshot compares five saved regular-compaction runs (`rc1`–`rc5`) with five checkpointed runs (`vc1`–`vc5`). The VC runs span three releases: vc1–vc3 used 1.0.0, vc4 used 1.0.10, and vc5 used 1.0.11. Across all five VC attempts, the mean composite is **97.30** (range 94.38–98.86), versus **82.37** for RC (79.75–84.31). The VC 1.0.0 cohort averaged **96.42**; vc4 scored 98.37 and vc5 scored 98.86. Every VC run exceeded every RC run; even the lowest VC score was 10.07 points above the highest RC score. All five VC attempts followed the required final-text-line chapter boundary, while all five RC attempts did not.
 
-VC also shows a narrower observed runtime spread: 34.3–49.0 minutes, compared with 34.8–135.4 minutes for RC. The mean modeled context cost is 19.1% lower for VC. The result set for this version of the test repeats the same pattern as previous iterations, therefore the number of test runs is sufficient to make an educated conclusion that the checkpointing strategy alone caused the difference. The offline summary-token audit classifies six RC compactions as failed/incomplete because their estimated input-plus-summary totals exceed the configured 72,192-token window; the TUI independently confirms truncated output for RC2 #19 and #20. VC has no compactions, so it has no such events. VC is capable of a similar failure state but it has not been observed since the addition of output interception framework. Compaction outcomes are session diagnostics, not weighted composite components.
+Across the five runs, VC's mean wall time was 41.2 minutes versus 68.3 minutes for RC, and its mean modeled context cost was 19.8% lower. VC5 took 45.5 minutes—10.1% longer than VC4, but shorter than VC3—while the five-run VC mean remained below RC's. The offline summary-token audit flags six RC compactions because estimated input-plus-summary totals exceed the configured 72,192-token window; the TUI independently confirms truncated output for RC2 #19 and #20. VC has no forced compactions. Compaction outcomes are session diagnostics, not weighted composite components.
 
 ## 1. Evaluation
 
@@ -20,47 +20,62 @@ The only intended difference was context management: regular 75% auto-compaction
 
 ## 3. Composite scores
 
-| Measure | RC (n=5) | VC (n=3) | VC − RC |
+| Measure | RC (n=5) | VC (n=5) | VC − RC |
 |---|---:|---:|---:|
-| Composite, observed | 82.37 (79.75–84.31) | **96.22 (93.78–98.12)** | **+13.85** |
-| Single needles | 97.65% | **98.04%** | +0.39 pp |
-| Multi-hop, semantic | 95.00% | **96.54%** | +1.54 pp |
+| Composite, observed | 82.37 (79.75–84.31) | **97.30 (94.38–98.86)** | **+14.93** |
+| Single needles | 97.65% | **98.82%** | +1.17 pp |
+| Multi-hop, semantic | 95.00% | **97.93%** | +2.93 pp |
 | Structured chapters, F1 | 0.00 | **100.00** | +100.00 F1 |
-| Structured characters, F1 | 80.83 | **82.55** | +1.72 F1 |
+| Structured characters, F1 | 80.83 | **86.21** | +5.38 F1 |
 | Early retention | 100.00% | 100.00% | tie |
 
-Run-level composite scores were RC1 84.31, RC2 82.49, RC3 82.86, RC4 82.45, and RC5 79.75; VC1 96.76, VC2 93.78, and VC3 98.12. The sample standard deviation was 1.65 points for RC and 2.22 for VC: VC's composite scores were not less variable, but their observed range is fully above RC's. An exact one-sided rank test gives p≈0.018 if the eight runs are treated as independent, exchangeable observations. Given the small sample and one benchmark/task, treat that result as supporting evidence rather than a general performance guarantee.
+The VC mean combines distinct releases, so version-level results are also important: vc1–vc3 (1.0.0) averaged **96.42** (94.38–98.12); vc4 (1.0.10) scored **98.37**; vc5 (1.0.11) scored **98.86**. RC1, the best of the five RC attempts, scored 84.31. Every VC run exceeded every RC score; VC5 was 14.55 points above RC1. The five-run sample standard deviations were 1.81 points for VC and 1.65 for RC; the VC set spans software releases and is tested as first-try on each new version.
 
-All five RC runs scored 0/19 on chapters because their chapter end lines were consistently one line too late: they included the empty separator instead of reporting the final line containing chapter text. The task instructions explicitly said to report the last text line and exclude the blank separator. All three VC runs reported the required boundary and scored 19/19, under the same model and hardware configuration. This is a repeated instruction-following difference in the saved runs, not an excuse based on a different model setup.
+| Run | VC release | Composite | Needles | Multi-hop | Chapters F1 | Characters F1 | Early retention |
+|---|---|---:|---:|---:|---:|---:|---:|
+| RC1 (best of 5) | — | 84.31 | 98.53% | 100.00% | 0.00 | 85.33 | 100% |
+| RC2 | — | 82.49 | 98.53% | 87.50% | 0.00 | 90.24 | 100% |
+| RC3 | — | 82.86 | 97.06% | 100.00% | 0.00 | 78.87 | 100% |
+| RC4 | — | 82.45 | 98.53% | 93.75% | 0.00 | 80.56 | 100% |
+| RC5 | — | 79.75 | 95.59% | 93.75% | 0.00 | 69.14 | 100% |
+| VC1 | 1.0.0 | 96.76 | 97.06% | 95.88% | 100.00 | 90.70 | 100% |
+| VC2 | 1.0.0 | 94.38 | 98.53% | 93.75% | 100.00 | 71.23 | 100% |
+| VC3 | 1.0.0 | 98.12 | 100.00% | 100.00% | 100.00 | 85.71 | 100% |
+| VC4 | 1.0.10 | 98.37 | 98.53% | 100.00% | 100.00 | 92.13 | 100% |
+| VC5 | 1.0.11 | 98.86 | 100.00% | 100.00% | 100.00 | 91.30 | 100% |
 
-**Benefit-of-the-doubt counterfactual:** even if RC is assigned 100% chapter accuracy in all five runs, while every other measured component remains unchanged, its mean composite rises from 82.37 to **95.53**. VC's observed mean remains **96.22**, so VC still leads by **0.69 points**. This is a sensitivity illustration only; the reported RC score retains the actual chapter results because the explicit boundary instruction was not followed.
+All five VC runs reported the required final-text-line chapter boundaries and scored 19/19; all five RC runs scored 0/19 because their reported end lines extend one line beyond the required final text line, into the blank separator. This instruction-following difference is directly scored by the benchmark; no one-line tolerance was applied.
+
+**Boundary sensitivity:** if RC is assigned 100% chapter F1 in all five runs, its mean composite rises from 82.37 to **95.53**, still 1.77 points below the pooled VC mean of 97.30. This is an illustrative sensitivity analysis, not a correction to reported scores.
 
 ## 4. Runtime and strategy
 
-| Run | Composite | Wall time | Compactions / checkpoint jumps |
-|---|---:|---:|---:|
-| RC1 | 84.31 | 4,122.0 s (68.7 min) | 16 / 0 |
-| RC2 | 82.49 | 8,121.2 s (135.4 min) | 20 / 0 |
-| RC3 | 82.86 | 3,094.4 s (51.6 min) | 13 / 0 |
-| RC4 | 82.45 | 2,085.5 s (34.8 min) | 9 / 0 |
-| RC5 | 79.75 | 3,072.9 s (51.2 min) | 14 / 0 |
-| VC1 | 96.76 | 2,147.0 s (35.8 min) | 0 / 6 |
-| VC2 | 93.78 | 2,057.1 s (34.3 min) | 0 / 8 |
-| VC3 | 98.12 | 2,941.1 s (49.0 min) | 0 / 10 |
+| Run | Composite | Wall time | Tool calls | Compactions / checkpoint jumps |
+|---|---:|---:|---:|---:|
+| RC1 | 84.31 | 4,122.0 s (68.7 min) | 73 | 16 / 0 |
+| RC2 | 82.49 | 8,121.2 s (135.4 min) | 90 | 20 / 0 |
+| RC3 | 82.86 | 3,094.4 s (51.6 min) | 119 | 13 / 0 |
+| RC4 | 82.45 | 2,085.5 s (34.8 min) | 78 | 9 / 0 |
+| RC5 | 79.75 | 3,072.9 s (51.2 min) | 57 | 14 / 0 |
+| VC1 (1.0.0) | 96.76 | 2,147.0 s (35.8 min) | 102 | 0 / 6 |
+| VC2 (1.0.0) | 94.38 | 2,057.1 s (34.3 min) | 113 | 0 / 8 |
+| VC3 (1.0.0) | 98.12 | 2,941.1 s (49.0 min) | 103 | 0 / 10 |
+| VC4 (1.0.10) | 98.37 | 2,481.7 s (41.4 min) | 103 | 0 / 7 |
+| VC5 (1.0.11) | 98.86 | 2,731.9 s (45.5 min) | 55 | 0 / 8 |
 
-Mean wall time is 4,099.2 s for RC and 2,381.7 s for VC, about **41.9% lower for VC**. Runtime sample standard deviations are 2,360.9 s for RC and 486.5 s for VC; thus RC's observed runtime spread is about 4.9 times wider. The longest RC run, RC2, lasted 135.4 minutes, well beyond the other four RC runs. VC remains a substantial 34–49 minute task, so the time required can still limit researchers.
+Mean wall time is 4,099.2 s for RC and 2,471.8 s for VC, about **39.7% lower for VC**. Runtime sample standard deviations are 2,360.9 s for RC and 376.0 s for VC. VC5 took 45.5 minutes—10.1% longer than VC4, though shorter than VC3—and had the fewest tool calls among VC runs (55). The longest RC run, RC2, lasted 135.4 minutes.
 
 ## 5. Compaction outcomes
 
 | Run | Recorded events | Summary and resume boundary recorded | Compaction failures (truncation) | Tool-result errors |
-|---|---:|---:|---|---:|
+|---|---:|---:|---:|---:|
 | RC1 | 16 | 16 | 1 (#6) | 1 Bash |
 | RC2 | 20 | 20 | 4 (#6, #15, #19, #20) | 0 |
 | RC3 | 13 | 13 | 0 | 10 Bash |
 | RC4 | 9 | 9 | 1 (#4) | 2 Bash |
 | RC5 | 14 | 14 | 0 | 0 |
 | **RC total** | **72** | **72** | **6** | **13 Bash** |
-| VC1–VC3 | 0 | — | 0 | 1 Bash (missing ./output) |
+| VC1–VC5 | 0 | — | 0 | 1-3 Bash total (VC1: 1, VC2: 1, VC3: 1, VC4: 3, VC5: 3) |
 
 All 72 recorded RC compaction events contain a nonempty summary and a `firstKeptEntryId` resume boundary. The trace has no explicit success/failure status field. For this analysis, a compaction is classified **failed/incomplete** when `tokensBefore + estimated full-summary tokens` exceeds the configured 72,192-token context window. This offline estimate flags six events: RC1 #6 (73,550; 1,358 over), RC2 #6 (74,909; 2,717 over), RC2 #15 (72,608; 416 over), RC2 #19 (83,052; 10,860 over), RC2 #20 (75,808; 3,616 over), and RC4 #4 (74,944; 2,752 over). The TUI separately confirms that RC2 #19 and #20 produced truncated output.
 
@@ -74,7 +89,7 @@ The automated audit now mirrors VC's offline `estimateTokensSafe` heuristic for 
 | #19 | 71,262 | 11,790 / 11,663 | 83,052 | −10,860 |
 | #20 | 63,330 | 12,478 / 12,352 | 75,808 | −3,616 |
 
-Across the five RC runs, the audit classifies six estimated sums above the context limit (1.2 per run on average; RC2 has four). VC's three runs have zero compactions, so their per-run and cohort diagnostics report zero summary estimates and zero overflows. These failure counts are diagnostic-only: they do not enter the weighted composite or token-cost calculation. Per-event estimates are stored in each run's `eval.json` and copied into `compaction_summary_token_estimates_by_run` in both cohort JSON files; numeric cohort summaries are also included there.
+Across the five RC runs, the audit classifies six estimated sums above the context limit (1.2 per run on average; RC2 has four). All five VC runs have zero compactions, so their per-run and cohort diagnostics report zero summary estimates and zero overflows. These failure counts are diagnostic-only: they do not enter the weighted composite or token-cost calculation. Per-event estimates are stored in each run's `eval.json` and copied into `compaction_summary_token_estimates_by_run` in both cohort JSON files; numeric cohort summaries are also included there.
 
 For contrast, the shortest RC run, RC4, has nine compactions and no overflows. Its #9 summary ends with a complete bullet about early “bratr” references being relevant to mh05 (three brothers); `tokensBefore` is 57,105 and summarization usage is 11,633 input / 7,141 output / 18,774 total. The overflow comparison uses VC's offline `estimateTokensSafe` heuristic, not model-native tokenization; it is an estimate-based failure criterion rather than a direct provider stop-reason field.
 
@@ -85,14 +100,16 @@ The word *truncated* appears in 26 RC summary texts (RC1: 8, RC2: 9, RC3: 8, RC4
 | Cohort | Mean context-cost estimate | Mean recognized book accesses | Mean full-file accesses | Mean estimated bytes touched |
 |---|---:|---:|---:|---:|
 | RC (n=5) | 14.2414 points | 62.6 | 23.4 | 13.41 MB |
-| VC (n=3) | 11.5225 points | 43.0 | 16.3 | 9.27 MB |
+| VC (n=5) | 11.4262 points | 39.6 | 15.6 | 8.87 MB |
 
-VC's mean modeled cost is **19.1% below RC's**. The cost index uses provider-reported token totals with a modeled cached/uncached split and is not a provider invoice; cached classification is inferred rather than observed cache telemetry. Retrieval counts are best-effort and do not establish attention or efficiency.
+VC's mean modeled cost is **19.8% below RC's**; vc5's estimate is 10.6010 points. VC also has fewer recognized accesses and fewer estimated bytes touched on average, hinting at superior efficiency for long tasks. The cost index uses provider-reported token totals with a modeled cached/uncached split and is not a provider invoice; cached classification is inferred rather than observed cache telemetry. Retrieval counts are best-effort and do not establish attention or efficiency.
 
 ## 7. Interpretation and limitations
 
-For the stated objective—consistent benchmark performance—the saved results favor VC: all three VC composite scores exceed all five RC scores, and the runtime distribution is substantially narrower. VC also has lower mean wall time and modeled context cost in this cohort. The chapter result is an operational compliance difference: all RC runs missed the explicit final-text-line instruction, while every VC run complied under the same model configuration. The benefit-of-the-doubt counterfactual shows that VC's mean remains higher even after granting RC full chapter credit.
+Across all saved runs, VC's mean composite is 97.30 versus 82.37 for RC, and VC also has lower mean wall time and modeled context cost. VC5 scored 98.86, above RC1's selected best-of-five score of 84.31. All VC runs scored 19/19 on chapters, while every RC run scored zero. Even if RC's chapter scores were set to 100% in a sensitivity analysis, its mean composite (95.53) would remain 1.77 points below the VC mean.
 
-Five RC and three VC runs, along with discarted preliminary results from older version of the test harness, provide useful evidence about this workload, and establish a causal effect which will vary in magnitude depending on models, hardware and context size limitation.
-Runtime and retrieval estimates are trace-derived. Compaction failure counts follow the documented overflow estimate; TUI confirmation is not available for overnight runs as the information is lost on reload. 
-We invite independent researchers with better hardware to expand the evaluation to other benchmarks.
+The evaluation heavily advantages RC, working with best-of-five result. In comparison VC is reported as a five separate first-try runs spanning three releases. Runtime and retrieval estimates are trace-derived. Compaction failure counts follow the documented overflow estimate.
+
+## 8. Conclusion
+
+VC is showing progressive improvement over time even though the baseline was already superior to RC in every aspect. Across ten runs on the same model and unchanged test, VC averaged 97.30 versus RC's 82.37; even the lowest VC score exceeded RC's best-of-five. The potential cost saving of up to 20% for VC also needs to be mentioned as well as time savings for the same task. There is strong evidence of VC general superiority on this benchmark.

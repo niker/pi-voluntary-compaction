@@ -31,6 +31,7 @@ You must always create a fresh new checkpoint:
 - immediately before the first read of a large file (then jump back to it between chunks; create a new one only after landing on a jump payload, to lock in accumulated knowledge)
 - immediately before every curl call or website download
 - immediately after receiving a jump payload - to lock-in the payload
+- immediately after the task assignment was clarified (like mapping coarse project structure, reading supplemental MD files)
 
 Always prefer to use MCP tools in code mode if available, especially when searching or listing tools.
 
@@ -52,13 +53,19 @@ Example timeline of processing:
 
 ### Examples of payload content
 
-- Tasks completed since checkpoint
-- Non-obvious facts learned
-- Files changed
+Should capture all relevant information since the target checkpoint:
+
+- Questions already answered to user
+- Tasks completed
+- Tasks pending
 - Unresolved questions
+- Non-obvious facts learned
+- Paths of all progress-tracking files written
+- Files changed
 - Plan of next actions
 - Final drafts of code
-- Result of the task (if any)
+- Whether the result of the task was already reported to user
+- Extract of all still-relevant user messages and clarifications since the target checkpoint
  
 ### After receiving a payload
 

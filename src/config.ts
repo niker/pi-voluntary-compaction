@@ -17,7 +17,7 @@ export type Config = {
 };
 
 export const DEFAULT_CONFIG: Config = {
-  softThresholdPercent: 65,
+  softThresholdPercent: 70,
   hardThresholdPercent: 80,
   workspaceReasoningBufferPercent: 5,
   maxToolOutputTokens: 8000,

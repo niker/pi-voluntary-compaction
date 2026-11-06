@@ -522,7 +522,10 @@ function checkpointJumpNotice(sm: SessionManager, id: number): string {
   if (percentage === undefined) return `[${notice}.]`;
   const formatted = roundedPercent(percentage);
   const generosity = percentage <= 45 ? "generous " : "";
-  return `[${notice}; workspace was cleared to ${generosity}${formatted}% utilization.]`;
+  // Application is deferred until this turn ends (or until queued input resumes
+  // the run), so nothing is freed yet when this notice is produced; and the
+  // figure is the target's utilisation when it was recorded, not a live reading.
+  return `[${notice}; workspace will be cleared to ${generosity}${formatted}% utilization.]`;
 }
 
 function nextCheckpointId(sm: SessionManager): number {
@@ -785,6 +788,7 @@ export default function (pi: ExtensionAPI): void {
   let jumpPending = false;
   let postJumpTurnProtected = false;
   let pendingJump: PendingJump | null = null;
+  let jumpAppliedEarly = false;
   let pendingForcedJumpInterruption: string | null = null;
   let pendingJumpOffer: PendingJumpOffer | null = null;
   let removeTerminalInput: (() => void) | null = null;
@@ -921,6 +925,45 @@ export default function (pi: ExtensionAPI): void {
       return false;
     }
     return true;
+  };
+
+  // Pi drains queued user input before emitting agent_end, so a jump requested
+  // by the terminating turn would otherwise be applied only after that input
+  // already ran on the unrewound context — and its rewind would then discard
+  // the user's new message along with everything appended since the jump.
+  // Applying it as the queued message starts (before it is persisted) keeps the
+  // message on the rewound branch. The message itself drives the continuation,
+  // so no extra continuation message is needed.
+  const applyPendingJumpForQueuedInput = (ctx: ExtensionContext): void => {
+    const request = pendingJump;
+    if (!request || request.subagent) return;
+    // The task_completed offer path is applied by the next `input` event.
+    if (request.taskCompleted && !request.autoResume) return;
+    pendingJump = null;
+    jumpAppliedEarly = true;
+    hardInterruptionPending = false;
+    hardJumpPending = false;
+    assistantBumpPending = false;
+    logInterceptor("queued_input_jump_applied", {
+      checkpointId: request.checkpointId,
+      targetId: request.target,
+      autoResume: request.autoResume,
+    });
+    try {
+      branchWithCheckpointVisibilitySnapshot(pi, manager(ctx), request.target, request.checkpointId, request.payload);
+      markCompactionComplete();
+    } catch (error) {
+      if (ctx.hasUI) ctx.ui.notify(`checkpoint_jump failed: ${error instanceof Error ? error.message : String(error)}`, "error");
+    } finally {
+      restoreHardThinking();
+      jumpPending = false;
+      if (hardInterruptionCancelledForJump) {
+        // The branch never happened, so re-arm the hard warning that this jump
+        // displaced; the next turn_start will evaluate pressure again.
+        hardInterruptionCancelledForJump = false;
+        hardFired = false;
+      }
+    }
   };
 
   if (process.env.PI_WEB_SESSION === "1") {
@@ -1183,6 +1226,11 @@ export default function (pi: ExtensionAPI): void {
     if (invalidJumpInterruptionTriggered
       || !CHECKPOINT_JUMP_TOOL_NAMES.includes(toolName as (typeof CHECKPOINT_JUMP_TOOL_NAMES)[number])
       || args == null
+      // Partial arguments stream key by key. While `target` has not arrived yet
+      // — the model may stream `payload` first — there is nothing to judge, so
+      // wait rather than treating a missing target as an invalid one and
+      // aborting a perfectly valid jump after a dozen streamed characters.
+      || !Object.prototype.hasOwnProperty.call(args, "target")
       || !Object.prototype.hasOwnProperty.call(args, "payload")) return;
 
     const target = args.target;
@@ -1348,6 +1396,7 @@ ${checkpointListForInterruption(ctx)}`;
     jumpPending = false;
     postJumpTurnProtected = false;
     pendingJump = null;
+    jumpAppliedEarly = false;
     pendingForcedJumpInterruption = null;
     clearJumpOffer(ctx);
     interceptorLogPath = null;
@@ -1540,7 +1589,11 @@ ${checkpointListForInterruption(ctx)}`;
     evaluatePressure(ctx);
     logInterceptor("turn_start", { before, after: pressureState() });
   });
-  pi.on("message_start", (event, _ctx) => {
+  pi.on("message_start", (event, ctx) => {
+    if (event.message.role === "user") {
+      applyPendingJumpForQueuedInput(ctx);
+      return;
+    }
     if (event.message.role !== "assistant") return;
     streamUpdateCount = 0;
     checkpointJumpCallInProgress = false;
@@ -2095,6 +2148,12 @@ ${checkpointListForInterruption(ctx)}`;
       // classified. Normal non-jump work was already interrupted immediately.
       checkpointJumpCallInProgress = false;
       checkpointJumpNamePending = false;
+      if (jumpAppliedEarly) {
+        // The payload was applied when queued input resumed this run; the branch
+        // write, pressure bookkeeping and thinking restore already happened.
+        jumpAppliedEarly = false;
+        jumpPending = false;
+      }
       if (hardInterruptionCancelledForJump) {
         hardInterruptionCancelledForJump = false;
         hardFired = false;
@@ -2160,7 +2219,7 @@ ${checkpointListForInterruption(ctx)}`;
             // This avoids losing the trigger when the runtime is still completing
             // the terminating turn that contained checkpoint_jump.
             setTimeout(() => {
-              pi.sendMessage({ customType: EXTENSION_TYPE, content: "checkpoint_jump completed and the payload is active. Resume the task from its next step now. When action is needed, use the registered tools through real tool calls; do not print tool-call/XML markup as text. If a tool action fails because of a workspace limit, use the reported limit to choose a smaller retrieval or jump to an earlier checkpoint, then continue.", display: false }, { triggerTurn: true, deliverAs: "followUp" });
+              pi.sendMessage({ customType: EXTENSION_TYPE, content: "checkpoint_jump completed and the payload is active. Resume the task from its next step now. When action is needed, use the registered tools through real tool calls; do not print tool-call/XML markup as text.", display: false }, { triggerTurn: true, deliverAs: "followUp" });
             }, 0);
           }
         }
