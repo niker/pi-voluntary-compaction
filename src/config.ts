@@ -2,6 +2,7 @@
 export type Config = {
   softThresholdPercent: number;
   hardThresholdPercent: number;
+  /** Reasoning reserve applied to retrieval/read sizing hints. */
   workspaceReasoningBufferPercent: number;
   maxToolOutputTokens: number;
   minimumJumpDistance: number;
@@ -14,12 +15,20 @@ export type Config = {
   advertiseVoluntaryCompaction: boolean;
   /** Default decision for a task-completed checkpoint jump in the TUI. */
   afterTaskCompaction: "denied" | "allowed";
+  /**
+   * Output tokens guaranteed to the forced-jump answer once retrieval workspace
+   * is exhausted at the hard threshold, replacing pi's fixed 4096-token output
+   * margin. Default 256: tool-output interception already bounds oversized
+   * results, so only a safety sliver is needed for extreme cases. null keeps
+   * pi's behavior. Range: 256-8192.
+   */
+  outputMarginFloorTokens: number | null;
 };
 
 export const DEFAULT_CONFIG: Config = {
-  softThresholdPercent: 70,
-  hardThresholdPercent: 80,
-  workspaceReasoningBufferPercent: 5,
+  softThresholdPercent: 75,
+  hardThresholdPercent: 85,
+  workspaceReasoningBufferPercent: 2.5,
   maxToolOutputTokens: 8000,
   minimumJumpDistance: 7.5,
   softMessage: [
@@ -37,6 +46,7 @@ export const DEFAULT_CONFIG: Config = {
   instructions: null,
   advertiseVoluntaryCompaction: true,
   afterTaskCompaction: "allowed",
+  outputMarginFloorTokens: 256,
 };
 
 export const config: Config = { ...DEFAULT_CONFIG };

@@ -30,10 +30,64 @@ const ENABLE_INTERCEPTOR_LOGGING = false;
 // These tools are bookkeeping for this extension, not conversation content.
 // Ignore their calls/results when choosing the latest meaningful checkpoint target.
 const INTERNAL_TOOLS = new Set([
-  "checkpoint_create", "subagent_checkpoint_create",
-  "checkpoint_jump", "subagent_checkpoint_jump", "checkpoint_list",
+  "checkpoint_create", "checkpoint_jump", "checkpoint_list",
 ]);
-const CHECKPOINT_JUMP_TOOL_NAMES = ["checkpoint_jump", "subagent_checkpoint_jump"] as const;
+const CHECKPOINT_JUMP_TOOL_NAMES = ["checkpoint_jump"] as const;
+// A headless session is a spawned child. The header's parentSession is
+// necessary but not sufficient: branched or forked main sessions inherit a
+// parentSession too, and server-hosted sessions report hasUI=false like
+// children do. The short fresh history guards the header path; the decisive
+// signal is the pi-subagents prompt marker, visible at before_agent_start.
+// The bound must stay above the handful of bootstrap entries a fresh child
+// carries at session_start.
+const HEADLESS_MAX_START_ENTRIES = 16;
+// Prompt markers pi-subagents writes into every child prompt (replace mode
+// adds "You are a pi coding agent sub-agent", append mode adds
+// <sub_agent_context>); both modes always carry the <active_agent> tag.
+const SUBAGENT_PROMPT_MARKERS = [
+  '<active_agent name=',
+  "You are a pi coding agent sub-agent",
+  "<sub_agent_context>",
+];
+// The extension module instance is shared by every session in a server
+// process, so the headless latch must be keyed per session id instead of
+// living in a single module-level boolean (only the first session would ever
+// run detection).
+interface HeadlessLatch {
+  headless: boolean;
+  identity: string;
+  detectedAt: string;
+  source: string;
+  signals: { parentSession: boolean; hasUI: boolean; startEntries: number; marker: boolean };
+}
+const headlessSessions = new Map<string, HeadlessLatch>();
+// Identity strings recorded in the durable detection entry so a session file
+// shows which contract was latched.
+const HEADLESS_IDENTITY = "I am headless subagent";
+const AGENT_IDENTITY = "I am agent";
+function isHeadlessSession(sm: { getSessionId(): string }): boolean {
+  return headlessSessions.has(sm.getSessionId());
+}
+// Records one detection per session id: a durable session entry and the
+// in-memory latch used for tool contracts and instructions. appendEntry is
+// provided by each call site's pi handle.
+function latchHeadlessSession(
+  pi: { appendEntry(type: string, data: unknown): void },
+  sessionId: string,
+  headless: boolean,
+  source: string,
+  signals: HeadlessLatch["signals"],
+): HeadlessLatch {
+  const identity = headless ? HEADLESS_IDENTITY : AGENT_IDENTITY;
+  const detectedAt = new Date().toISOString();
+  const latch: HeadlessLatch = { headless, identity, detectedAt, source, signals };
+  headlessSessions.set(sessionId, latch);
+  pi.appendEntry(HEADLESS_SESSION_ENTRY_TYPE, {
+    ...latch,
+    maxStartEntries: HEADLESS_MAX_START_ENTRIES,
+  });
+  return latch;
+}
 const IMAGE_READ_EXTENSIONS = new Set([".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp"]);
 const SMALL_TOOL_OUTPUT_MAX_CHARS = 500;
 const PASSIVE_ENTRIES = new Set(["custom", "label", "session_info", "model_change", "thinking_level_change"]);
@@ -400,16 +454,45 @@ function workspaceUsedPercent(ctx: ExtensionContext): number | null {
   return Math.min(100, Math.max(0, reportableTokens / reportableCapacityTokens * 100));
 }
 
+// Raw workspace left before the hard threshold: every token of tool output
+// beyond this is what exhausts the workspace and triggers the hard jump. The
+// reasoning buffer deliberately does NOT shrink this figure — interception
+// already bounds single results, so withholding ~3-5% of the window here only
+// undersized the workspace. Pressure checks use this raw figure.
 function retrievalWorkspaceTokens(ctx: ExtensionContext): number | null {
   const usage = ctx.getContextUsage();
   if (!usage || usage.contextWindow <= 0) return null;
   const tokens = usage.tokens ?? (usage.percent == null ? null : usage.percent / 100 * usage.contextWindow);
   if (tokens == null || !Number.isFinite(tokens)) return null;
-  return Math.floor(usage.contextWindow * config.hardThresholdPercent / 100 - tokens - usage.contextWindow * config.workspaceReasoningBufferPercent / 100);
+  return Math.floor(usage.contextWindow * config.hardThresholdPercent / 100 - tokens);
+}
+
+// Budget quoted to the agent in retrieval/read sizing hints. Unlike raw
+// workspace it reserves the reasoning buffer (the model's next reasoning turn
+// plus the follow-up pagination call) and an envelope sliver for the page
+// footer, refusal-notice text, and pi's tool-result framing — the advisory
+// line counter measures raw lines only, so without this reserve the quoted
+// page size is structurally too big and retries ratchet downward.
+const ADVISORY_ENVELOPE_RESERVE_TOKENS = 256;
+
+function advisoryWorkspaceTokens(ctx: ExtensionContext): number | null {
+  const raw = retrievalWorkspaceTokens(ctx);
+  if (raw === null) return null;
+  const usage = ctx.getContextUsage();
+  const reasoningReserve = usage && usage.contextWindow > 0
+    ? Math.floor(usage.contextWindow * config.workspaceReasoningBufferPercent / 100)
+    : 0;
+  return Math.max(0, raw - reasoningReserve - ADVISORY_ENVELOPE_RESERVE_TOKENS);
 }
 
 const CHECKPOINT_ENTRY_TYPE = "pi-voluntary-compaction-checkpoint";
 const CHECKPOINT_VISIBILITY_ENTRY_TYPE = "pi-voluntary-compaction-checkpoint-visibility";
+const HEADLESS_SESSION_ENTRY_TYPE = "pi-voluntary-compaction-headless-session";
+// A hard interruption forces thinking off, and pi persists that change as a
+// `thinking_level_change` entry that is indistinguishable from the user choosing
+// off. This hint records the level being replaced so a session that crashes
+// before the jump can restore what the user actually had configured.
+const THINKING_HINT_ENTRY_TYPE = "pi-voluntary-compaction-thinking";
 
 const WORKSPACE_PERCENT_VERSION = 3;
 type CheckpointLabel = { id: number; name: string; workspaceUsedPercent?: number };
@@ -461,6 +544,40 @@ function formatCheckpointLabel(checkpoint: CheckpointLabel, workspaceDelta?: num
   const formatted = roundedPercent(percentage);
   const delta = workspaceDelta === undefined ? "" : `, Δ ${roundedPercent(workspaceDelta)}%`;
   return `[${checkpoint.id}]: ${checkpoint.name} (utilization: ${formatted}%${delta})`;
+}
+
+type ForcedThinkingHint = { thinkingLevel: string };
+
+function forcedThinkingHintRecord(value: unknown): ForcedThinkingHint | undefined {
+  if (!value || typeof value !== "object") return undefined;
+  const record = value as { thinkingLevel?: unknown };
+  return typeof record.thinkingLevel === "string" && record.thinkingLevel.length > 0
+    ? { thinkingLevel: record.thinkingLevel }
+    : undefined;
+}
+
+// The hint is authoritative only while it is the newest thinking-level decision on
+// the branch. Any `thinking_level_change` entry appended after it means the user
+// changed /thinking, or that the interruption restored the level normally, so pi's
+// own persisted state is correct and there is nothing to recover.
+function recoverableForcedThinkingLevel(sm: SessionManager): string | undefined {
+  const entries = [...sm.getBranch()];
+  let hint: string | undefined;
+  let hintIndex = -1;
+  for (let index = 0; index < entries.length; index++) {
+    const entry = entries[index];
+    if (entry.type !== "custom" || entry.customType !== THINKING_HINT_ENTRY_TYPE) continue;
+    const record = forcedThinkingHintRecord(entry.data);
+    if (record) {
+      hint = record.thinkingLevel;
+      hintIndex = index;
+    }
+  }
+  if (hint === undefined) return undefined;
+  for (let index = hintIndex + 1; index < entries.length; index++) {
+    if (entries[index].type === "thinking_level_change") return undefined;
+  }
+  return hint;
 }
 
 function persistedCheckpointEntries(sm: SessionManager): StoredCheckpoint[] {
@@ -633,22 +750,33 @@ function autoCompactionEnabled(ctx: ExtensionContext): boolean {
   return enabled;
 }
 
-function loadAgentInstructions(): string {
+function loadAgentInstructions(fallback?: string | null): string | null {
   const candidates = [
     new URL("../instructions/context-management.md", import.meta.url),
     new URL("./instructions/context-management.md", import.meta.url),
   ];
   const path = candidates.find((candidate) => existsSync(candidate));
   if (!path) {
+    if (fallback !== undefined) return fallback ?? null;
     throw new Error("pi-voluntary-compaction: instructions/context-management.md was not found beside the extension");
   }
+  return readFileSync(path, "utf8").trim();
+}
+
+function loadHeadlessAgentInstructions(fallback: string | null): string | null {
+  const candidates = [
+    new URL("../instructions/context-management-headless.md", import.meta.url),
+    new URL("./instructions/context-management-headless.md", import.meta.url),
+  ];
+  const path = candidates.find((candidate) => existsSync(candidate));
+  if (!path) return fallback;
   return readFileSync(path, "utf8").trim();
 }
 
 const CONFIG_KEYS: (keyof Config)[] = [
   "softThresholdPercent", "hardThresholdPercent", "workspaceReasoningBufferPercent", "maxToolOutputTokens", "minimumJumpDistance", "softMessage",
   "hardReasoningMessage", "hardNonReasoningMessage", "instructions",
-  "advertiseVoluntaryCompaction", "afterTaskCompaction",
+  "advertiseVoluntaryCompaction", "afterTaskCompaction", "outputMarginFloorTokens",
 ];
 type ConfigOverrides = Partial<Config>;
 
@@ -672,7 +800,11 @@ function validConfig(value: any): value is Config {
     && typeof value.hardNonReasoningMessage === "string"
     && (value.instructions === null || typeof value.instructions === "string")
     && typeof value.advertiseVoluntaryCompaction === "boolean"
-    && (value.afterTaskCompaction === "denied" || value.afterTaskCompaction === "allowed");
+    && (value.afterTaskCompaction === "denied" || value.afterTaskCompaction === "allowed")
+    && (value.outputMarginFloorTokens === null
+      || (Number.isSafeInteger(value.outputMarginFloorTokens)
+        && value.outputMarginFloorTokens >= 256
+        && value.outputMarginFloorTokens <= 8192));
 }
 
 function validOverrides(value: any): value is ConfigOverrides {
@@ -685,6 +817,11 @@ function validOverrides(value: any): value is ConfigOverrides {
     if (key === "maxToolOutputTokens") return typeof item === "number" && Number.isSafeInteger(item) && item >= 1;
     if (key === "advertiseVoluntaryCompaction") return typeof item === "boolean";
     if (key === "afterTaskCompaction") return item === "denied" || item === "allowed";
+    // Token counts are not percentages: validate before the generic 0-100 branch.
+    if (key === "outputMarginFloorTokens") {
+      return item === null
+        || (typeof item === "number" && Number.isSafeInteger(item) && item >= 256 && item <= 8192);
+    }
     if (key.endsWith("Message")) return typeof item === "string";
     return typeof item === "number" && Number.isFinite(item) && item >= 0 && item <= 100;
   });
@@ -755,7 +892,7 @@ function loadSavedConfig(ctx: ExtensionContext): void {
 const SETTING_DESCRIPTIONS: Record<keyof Config, string> = {
   softThresholdPercent: "Soft warning threshold: when reached, the model receives an advisory to finish its current sub-task and preserve useful results in a checkpoint payload.",
   hardThresholdPercent: "Hard warning threshold: when context usage reaches this percentage, the model is urgently instructed to return to a checkpoint; reasoning models also receive a synthetic interruption.",
-  workspaceReasoningBufferPercent: "Context reserved for reasoning while deciding whether a read or retrieved output fits in the available workspace. Range: 0-25%.",
+  workspaceReasoningBufferPercent: "Context reserved for reasoning while deciding whether a read or retrieved output fits in the available workspace. Only really useful for models that cannot turn thinking off; set it to 0 when your model supports disabling reasoning. Range: 0-25%.",
   maxToolOutputTokens: "Maximum estimated token size for a single non-read tool output before it is paginated. Checkpoint and pagination tools are excluded.",
   minimumJumpDistance: "The minimum workspace utilization difference for a checkpoint jump to be valid when the target is above the soft threshold. Range: 0-100%.",
   softMessage: "Message sent to the model at the soft threshold. Use it to explain how the model should prepare before context becomes critical.",
@@ -764,6 +901,7 @@ const SETTING_DESCRIPTIONS: Record<keyof Config, string> = {
   instructions: "Instructions appended to the system prompt. The package Markdown is used when this is set to the default (null); custom text replaces it.",
   advertiseVoluntaryCompaction: "Controls whether checkpoint and voluntary-compaction instructions are advertised in the system prompt. Pressure warnings and tools remain active when disabled.",
   afterTaskCompaction: "Default decision shown after the agent requests task compaction. Alt+C toggles it in the TUI; pi-web provides /jump and /nojump commands before the next message applies it.",
+  outputMarginFloorTokens: "Output tokens reserved for the forced-jump answer when workspace is exhausted at the hard threshold, replacing pi's fixed 4096-token margin. Default 256 keeps only a safety sliver because tool-output interception already bounds oversized results. Set to null (empty) to keep pi's behavior. Range: 256-8192.",
 };
 
 export default function (pi: ExtensionAPI): void {
@@ -777,6 +915,9 @@ export default function (pi: ExtensionAPI): void {
   let hardInterruptionCancelledForJump = false;
   let assistantBumpPending = false;
   let hardThinkingPrevious: ReturnType<ExtensionAPI["getThinkingLevel"]> | null = null;
+  // Set when the user changes /thinking to a level other than "off" while a hard
+  // interruption holds thinking off. The manual choice wins over the captured value.
+  let userChoseThinkingLevelDuringHardOff = false;
   const activeToolCalls = new Set<string>();
   let checkpointJumpCallInProgress = false;
   let checkpointJumpNamePending = false;
@@ -790,6 +931,25 @@ export default function (pi: ExtensionAPI): void {
   let pendingJump: PendingJump | null = null;
   let jumpAppliedEarly = false;
   let pendingForcedJumpInterruption: string | null = null;
+  // Hard-limit continuation text awaiting delivery after an immediate abort.
+  // Kept separate from `pendingForcedJumpInterruption` (invalid-jump retry) so
+  // the two follow-ups cannot overwrite each other.
+  let pendingHardLimitFollowup: string | null = null;
+  // Latched while an abort-at-hard-limit continuation is owed, so agent_end can
+  // deliver or discard it exactly once.
+  let hardLimitFollowupPending = false;
+  // Hard interruptions injected since the assistant last produced any output or
+  // tool call. A resumed session can already be over the provider's context
+  // window: every request fails instantly and leaves an empty assistant turn,
+  // while each injected warning only enlarges an already-rejected prompt. With
+  // no progress check the evaluator re-arms forever (bug13: ~5 injections per
+  // second, unbounded, until the user killed the process).
+  let interruptionsSinceAssistantProgress = 0;
+  let hardInterruptionStalled = false;
+  // Multiple lifecycle hooks (message_end, turn_end and both agent_end handlers)
+  // each dispatch once while pressure stays pending, so one turn could inject the
+  // same warning twice. Every injection costs ~350 tokens of checkpoint list.
+  let interruptionDispatchedThisTurn = false;
   let pendingJumpOffer: PendingJumpOffer | null = null;
   let removeTerminalInput: (() => void) | null = null;
   let interceptorLogPath: string | null = null;
@@ -865,6 +1025,7 @@ export default function (pi: ExtensionAPI): void {
     hardJumpPending,
     hardInterruptionCancelledForJump,
     jumpPending,
+    hardLimitFollowupPending,
   });
 
   const renderCompactionOffer = (ctx: ExtensionContext): void => {
@@ -982,6 +1143,29 @@ export default function (pi: ExtensionAPI): void {
   }
 
   pi.on("session_start", (_event, ctx) => {
+    // Latch the headless contract once per session before any turn builds its
+    // tool list: spawned children keep the private variant semantics even if
+    // the same session file is later resumed with UI.
+    const sessionId = manager(ctx).getSessionId();
+    // Detection runs once per session id for the lifetime of this module
+    // instance. Every session_start appends its durable record, so redeployed
+    // or reloaded modules re-detect instead of trusting a stale one-shot latch.
+    if (!headlessSessions.has(sessionId)) {
+      const header = manager(ctx).getHeader();
+      const startEntries = manager(ctx).getBranch().length;
+      // Header-only latch: parentSession set AND a short fresh history. A
+      // branched main session passes the header test but carries the parent's
+      // long branch; server-hosted mains report hasUI=false, so hasUI must
+      // not substitute for the history bound. Ambiguous cases stay unlatched
+      // until before_agent_start reads the prompt markers.
+      const headless = Boolean(header?.parentSession)
+        && startEntries <= HEADLESS_MAX_START_ENTRIES;
+      if (headless) {
+        latchHeadlessSession(pi, sessionId, true, "header",
+          { parentSession: true, hasUI: ctx.hasUI, startEntries, marker: false });
+        registerHeadlessToolContracts();
+      }
+    }
     removeTerminalInput?.();
     removeTerminalInput = ctx.hasUI ? ctx.ui.onTerminalInput((data) => {
       if (!pendingJumpOffer || !matchesKey(data, "alt+c")) return;
@@ -1026,9 +1210,29 @@ export default function (pi: ExtensionAPI): void {
   }
 
   const defaultInstructions = loadAgentInstructions();
-  pi.on("before_agent_start", (event) => {
+  const defaultHeadlessInstructions = loadHeadlessAgentInstructions(defaultInstructions);
+  pi.on("before_agent_start", (event, ctx) => {
+    // Finalize the headless latch from the effective prompt: pi-subagents
+    // stamps every child with an <active_agent> tag plus a sub-agent header,
+    // which no main session carries. This is the decisive signal when the
+    // session_start header heuristic was ambiguous (branched mains,
+    // server-hosted sessions with hasUI=false).
+    const sm = manager(ctx);
+    const sessionId = sm.getSessionId();
+    if (!headlessSessions.has(sessionId)) {
+      const marker = SUBAGENT_PROMPT_MARKERS.some((marker) => event.systemPrompt.includes(marker));
+      const header = sm.getHeader();
+      const startEntries = sm.getBranch().length;
+      if (marker || Boolean(header?.parentSession)) {
+        latchHeadlessSession(pi, sessionId, marker, "before_agent_start",
+          { parentSession: Boolean(header?.parentSession), hasUI: ctx.hasUI, startEntries, marker });
+        if (marker) registerHeadlessToolContracts();
+      }
+    }
+    const latch = headlessSessions.get(sessionId);
     if (!config.advertiseVoluntaryCompaction) return;
-    const instructions = config.instructions ?? defaultInstructions;
+    const instructions = config.instructions
+      ?? (latch?.headless ? defaultHeadlessInstructions : defaultInstructions);
     if (!instructions) return;
     return {
       systemPrompt: `${event.systemPrompt}\n\n${instructions}`,
@@ -1057,6 +1261,7 @@ export default function (pi: ExtensionAPI): void {
         ["instructions", `Agent instructions (${edited.instructions === null ? "package default" : "custom"})`],
         ["advertiseVoluntaryCompaction", "Advertise voluntary compaction"],
         ["afterTaskCompaction", "After task compaction default"],
+        ["outputMarginFloorTokens", "Forced-jump output floor"],
       ];
 
       while (true) {
@@ -1073,7 +1278,7 @@ export default function (pi: ExtensionAPI): void {
             edited.instructions = null;
             editedKeys.add(key);
           } else if (mode === "Edit custom instructions") {
-            const value = await ctx.ui.editor(`Edit agent instructions\n\n${description}`, edited.instructions ?? defaultInstructions);
+            const value = await ctx.ui.editor(`Edit agent instructions\n\n${description}`, edited.instructions ?? defaultInstructions ?? undefined);
             if (value != null) {
               edited.instructions = value;
               editedKeys.add(key);
@@ -1103,6 +1308,26 @@ export default function (pi: ExtensionAPI): void {
             edited.afterTaskCompaction = "allowed";
             editedKeys.add(key);
           }
+          continue;
+        }
+
+        if (key === "outputMarginFloorTokens") {
+          const current = edited.outputMarginFloorTokens;
+          const value = await ctx.ui.editor(`Edit ${selected}\n\n${description}`, current === null ? "" : String(current));
+          if (value == null) continue;
+          const trimmed = value.trim();
+          if (trimmed === "") {
+            edited.outputMarginFloorTokens = null;
+            editedKeys.add(key);
+            continue;
+          }
+          const number = Number(trimmed);
+          if (!Number.isSafeInteger(number) || number < 256 || number > 8192) {
+            ctx.ui.notify("Forced-jump output floor must be a whole number between 256 and 8192 tokens, or empty for pi's default.", "error");
+            continue;
+          }
+          edited.outputMarginFloorTokens = number;
+          editedKeys.add(key);
           continue;
         }
 
@@ -1177,12 +1402,61 @@ export default function (pi: ExtensionAPI): void {
 
   const restoreHardThinking = () => {
     const previous = hardThinkingPrevious;
+    const overridden = userChoseThinkingLevelDuringHardOff;
     hardThinkingPrevious = null;
+    userChoseThinkingLevelDuringHardOff = false;
     if (previous === null) return;
+    // A hard interruption leaves thinking off until the jump is applied, so any
+    // other level here is a manual /thinking change made while the payload was
+    // being composed. Never overwrite it: the captured value becomes stale.
+    let current: ReturnType<ExtensionAPI["getThinkingLevel"]> | null = null;
+    try {
+      current = pi.getThinkingLevel();
+    } catch {
+      // The runtime may be shutting down or switching sessions.
+    }
+    if (overridden || (current !== null && current !== "off")) {
+      logInterceptor("hard_thinking_restore_skipped_user_override", { captured: previous, current });
+      return;
+    }
     try {
       pi.setThinkingLevel(previous);
     } catch {
       // The runtime may be shutting down or switching sessions.
+    }
+  };
+
+  pi.on("thinking_level_select", (event) => {
+    // While a hard interruption holds the captured level, this extension only ever
+    // sets "off", so any other selected level is the user's own choice.
+    if (hardThinkingPrevious === null || event.level === "off") return;
+    userChoseThinkingLevelDuringHardOff = true;
+    logInterceptor("hard_thinking_user_override_recorded", {
+      captured: hardThinkingPrevious,
+      chosen: event.level,
+    });
+  });
+
+  // Recovery for a session that crashed after a hard interruption: the branch ends
+  // at the artificial "off", so restore the level persisted just before it. Runs
+  // before pressure is evaluated so a new interruption captures the real level.
+  const recoverThinkingAfterResume = (ctx: ExtensionContext) => {
+    if (hardThinkingPrevious !== null) return;
+    const level = recoverableForcedThinkingLevel(manager(ctx));
+    if (!level || level === "off") return;
+    let current: ReturnType<ExtensionAPI["getThinkingLevel"]> | null = null;
+    try {
+      current = pi.getThinkingLevel();
+    } catch {
+      return;
+    }
+    if (current === level) return;
+    try {
+      pi.setThinkingLevel(level as ReturnType<ExtensionAPI["getThinkingLevel"]>);
+      logInterceptor("hard_thinking_resumed_from_hint", { level, before: current });
+      if (ctx.hasUI) ctx.ui.notify(`pi-voluntary-compaction: restored thinking level ${level} after resume`, "info");
+    } catch {
+      // The runtime may reject a thinking level before the model is ready.
     }
   };
 
@@ -1266,8 +1540,54 @@ export default function (pi: ExtensionAPI): void {
     restoreHardThinking();
   };
 
+  // Two injections give the model two chances to emit checkpoint_jump. A third
+  // can only help if the assistant answered in between; otherwise it keeps
+  // feeding a context that can no longer answer.
+  const MAX_HARD_INTERRUPTIONS_WITHOUT_PROGRESS = 2;
+
+  // Any assistant output or tool call proves the model can still act on a hard
+  // interruption, so pressure may inject again.
+  const noteAssistantProgress = (kind: string): void => {
+    if (!hardInterruptionStalled && interruptionsSinceAssistantProgress === 0) return;
+    logInterceptor("hard_interruption_progress_resumed", {
+      kind,
+      interruptionsSinceAssistantProgress,
+      stalled: hardInterruptionStalled,
+    });
+    interruptionsSinceAssistantProgress = 0;
+    hardInterruptionStalled = false;
+  };
+
+  const assistantMessageHasOutput = (message: any): boolean => {
+    const parts = Array.isArray(message?.content) ? message.content : [];
+    return parts.some((part: any) => part?.type === "toolCall"
+      || (part?.type === "text" && typeof part.text === "string" && part.text.trim().length > 0)
+      || (part?.type === "thinking" && typeof part.thinking === "string" && part.thinking.trim().length > 0));
+  };
+
+  const noteHardInterruptionInjected = (ctx: ExtensionContext, via: string): void => {
+    interruptionDispatchedThisTurn = true;
+    interruptionsSinceAssistantProgress += 1;
+    if (interruptionsSinceAssistantProgress < MAX_HARD_INTERRUPTIONS_WITHOUT_PROGRESS) return;
+    hardInterruptionStalled = true;
+    logInterceptor("hard_interruption_stalled_no_progress", { via, ...pressureState() });
+    if (ctx.hasUI) {
+      ctx.ui.notify(
+        `pi-voluntary-compaction: ${interruptionsSinceAssistantProgress} hard interruptions produced no assistant answer; injections stopped. Recover with /tree, then continue.`,
+        "warning",
+      );
+    }
+  };
+
   const dispatchHardInterruption = (ctx: ExtensionContext): void => {
     if (!hardInterruptionPending) return;
+    // The model cannot answer at this context size; further injections only grow
+    // a prompt the provider already rejected. Recovery is manual (pi's /tree).
+    if (hardInterruptionStalled) return;
+    if (interruptionDispatchedThisTurn) {
+      logInterceptor("hard_interruption_suppressed_for_turn", pressureState());
+      return;
+    }
     if (jumpPending || checkpointJumpCallInProgress) {
       // Wait for the jump tool's distance validation. Only its accepted
       // execution may clear hard pressure and restore the prior thinking level.
@@ -1284,6 +1604,35 @@ export default function (pi: ExtensionAPI): void {
 
 Available checkpoints (use one of these IDs; do not call checkpoint_list):
 ${checkpointListForInterruption(ctx)}`;
+
+    // Ordinary hard steering is queued and lands at the next step boundary, so a
+    // long assistant turn keeps adding output before pressure can act. Once
+    // retrieval workspace is exhausted there is no room left for that turn: its
+    // output — usually the required jump payload — truncates instead of freeing
+    // context. Abort the active stream now and deliver the continuation when the
+    // run settles, reusing the pattern already proven for invalid jumps. This
+    // abort is unconditional: at exhausted retrieval it is the only path that
+    // leaves room for the jump payload, so it is not user-configurable.
+    const retrieval = retrievalWorkspaceTokens(ctx);
+    if (turnInProgress && !ctx.isIdle() && retrieval !== null && retrieval <= 0) {
+      try {
+        pi.setThinkingLevel("off");
+        hardInterruptionPending = false;
+        pendingHardLimitFollowup = message;
+        hardLimitFollowupPending = true;
+        ctx.abort();
+        logInterceptor("hard_interruption_aborted_stream", { retrievalWorkspaceTokens: retrieval, ...pressureState() });
+        noteHardInterruptionInjected(ctx, "abort");
+        if (ctx.hasUI) ctx.ui.notify(`pi-voluntary-compaction: hard limit aborted the active turn (${config.hardThresholdPercent}%)`, "error");
+      } catch (error) {
+        pendingHardLimitFollowup = null;
+        hardLimitFollowupPending = false;
+        hardInterruptionPending = true;
+        logInterceptor("hard_interruption_abort_failed", { error: String(error), ...pressureState() });
+      }
+      return;
+    }
+
     try {
       // Re-apply this immediately before dispatching. The runtime can prepare
       // the next turn after turn_end and overwrite the level set earlier.
@@ -1295,6 +1644,7 @@ ${checkpointListForInterruption(ctx)}`;
       pi.sendUserMessage(message, { deliverAs: ctx.isIdle() ? "followUp" : "steer" });
       hardInterruptionPending = false;
       logInterceptor("hard_interruption_dispatched", pressureState());
+      noteHardInterruptionInjected(ctx, "send");
       if (ctx.hasUI) ctx.ui.notify(`pi-voluntary-compaction: hard warning (${config.hardThresholdPercent}%)`, "error");
     } catch (error) {
       logInterceptor("hard_interruption_dispatch_failed", { error: String(error), ...pressureState() });
@@ -1308,17 +1658,35 @@ ${checkpointListForInterruption(ctx)}`;
     }
   };
 
-  const triggerHardInterruption = (ctx: ExtensionContext) => {
-    if (hardFired) return;
+  // `force` re-arms a hard interruption that the threshold evaluator would
+  // suppress. Used when retrieval workspace is exhausted below the configured
+  // hard percent, and by the zero-budget tool-output path: waiting for the raw
+  // percent to cross the hard threshold leaves no room to emit the jump.
+  const triggerHardInterruption = (ctx: ExtensionContext, force = false) => {
+    // A stalled interruption must not be re-armed by `force`: the assistant has
+    // not answered, so there is nothing new to interrupt.
+    if (hardInterruptionStalled) return;
+    if (hardFired && !force) return;
+    if (force && (jumpPending || postJumpTurnProtected)) return;
     try {
       if (hardThinkingPrevious === null) {
-        hardThinkingPrevious = pi.getThinkingLevel();
+        const captured = pi.getThinkingLevel();
+        userChoseThinkingLevelDuringHardOff = false;
+        hardThinkingPrevious = captured;
         pi.setThinkingLevel("off");
+        // pi's own entry records only the artificial off, so persist the level it
+        // replaced for crash recovery. Appending after the forced off is what lets
+        // `recoverableForcedThinkingLevel` treat a later user change as newer.
+        try {
+          pi.appendEntry(THINKING_HINT_ENTRY_TYPE, { thinkingLevel: captured });
+        } catch {
+          // A session that cannot append entries simply cannot recover the level.
+        }
       }
       hardJumpPending = true;
       hardInterruptionPending = true;
       hardFired = true;
-      logInterceptor("hard_interruption_triggered", { turnInProgress, ...pressureState() });
+      logInterceptor("hard_interruption_triggered", { turnInProgress, force, ...pressureState() });
       // During a turn, wait for the assistant response to resolve whether it
       // is a checkpoint jump. This prevents a warning at turn_start or in the
       // text prefix from interrupting before toolcall_start identifies a jump.
@@ -1349,10 +1717,20 @@ ${checkpointListForInterruption(ctx)}`;
     if (percent < config.hardThresholdPercent) {
       if (!hardJumpPending && !hardInterruptionCancelledForJump && !checkpointJumpCallInProgress) hardFired = false;
       assistantBumpPending = false;
+      // Pressure relieved (a jump, /tree or ordinary work lowered usage), so a
+      // later breach must be able to inject again even if the model never
+      // answered while usage was high.
+      interruptionsSinceAssistantProgress = 0;
+      hardInterruptionStalled = false;
     }
     if (percent < config.softThresholdPercent) return;
-    if (percent >= config.hardThresholdPercent) {
-      triggerHardInterruption(ctx);
+    // Retrieval workspace is exhausted once tokens reach the configured hard
+    // percent of the context window (raw retrieval figure; the reasoning buffer
+    // is reserved inside sizing hints, not here).
+    const retrieval = retrievalWorkspaceTokens(ctx);
+    const exhausted = retrieval !== null && retrieval <= 0;
+    if (percent >= config.hardThresholdPercent || exhausted) {
+      triggerHardInterruption(ctx, exhausted);
       return;
     }
     if (!softFired) {
@@ -1398,6 +1776,11 @@ ${checkpointListForInterruption(ctx)}`;
     pendingJump = null;
     jumpAppliedEarly = false;
     pendingForcedJumpInterruption = null;
+    pendingHardLimitFollowup = null;
+    hardLimitFollowupPending = false;
+    interruptionsSinceAssistantProgress = 0;
+    hardInterruptionStalled = false;
+    interruptionDispatchedThisTurn = false;
     clearJumpOffer(ctx);
     interceptorLogPath = null;
     interceptorLogSequence = 0;
@@ -1413,6 +1796,7 @@ ${checkpointListForInterruption(ctx)}`;
         interceptorLogPath = null;
       }
     }
+    recoverThinkingAfterResume(ctx);
     checkAutoCompactionSetting(ctx);
     watchAutoCompactionSettings(ctx);
     evaluatePressure(ctx);
@@ -1429,8 +1813,7 @@ ${checkpointListForInterruption(ctx)}`;
 
     // Keep VC's own checkpoint and pagination results out of the interceptor.
     if (event.toolName.startsWith("output_receive_")
-      || event.toolName.startsWith("checkpoint_")
-      || event.toolName.startsWith("subagent_checkpoint_")) return;
+      || event.toolName.startsWith("checkpoint_")) return;
 
     const clippedRead = event.toolName === "read" ? clippedReads.get(event.toolCallId) : undefined;
     if (event.toolName === "read") clippedReads.delete(event.toolCallId);
@@ -1475,7 +1858,7 @@ ${checkpointListForInterruption(ctx)}`;
             : {}),
         };
         const { estimatedTokens } = await estimateReadFileStats(file, ctx.signal);
-        const workspaceTokens = retrievalWorkspaceTokens(ctx);
+        const workspaceTokens = advisoryWorkspaceTokens(ctx);
         if (workspaceTokens === null) return;
         const exceedsWorkspace = estimatedTokens > workspaceTokens;
         if (!exceedsWorkspace) {
@@ -1504,7 +1887,9 @@ ${checkpointListForInterruption(ctx)}`;
         return {
           content: [{
             type: "text" as const,
-            text: `Read is too large for available workspace, only ${recommendedLines} lines would fit. To free more workspace and read bigger chunks, jump to an earlier checkpoint before trying again.`,
+            text: recommendedLines <= 0
+              ? `Read is too large for available workspace; no line fits. Jump now, then read smaller chunks.`
+              : `Read is too large for available workspace, only ${recommendedLines} lines would fit. To free more workspace and read bigger chunks, jump to an earlier checkpoint before trying again.`,
           }],
           details: {},
         };
@@ -1517,7 +1902,7 @@ ${checkpointListForInterruption(ctx)}`;
 
     const resultContent = event.content;
     const estimatedTokens = estimateContentTokens(resultContent);
-    const workspaceTokens = retrievalWorkspaceTokens(ctx);
+    const workspaceTokens = advisoryWorkspaceTokens(ctx);
     if (event.toolName === "read" && workspaceTokens === null) return;
     const exceedsWorkspace = workspaceTokens !== null && estimatedTokens > workspaceTokens;
     if (event.toolName === "read") {
@@ -1526,7 +1911,9 @@ ${checkpointListForInterruption(ctx)}`;
       return {
         content: [{
           type: "text" as const,
-          text: `Read is too large for available workspace, only ${recommendedLines} lines would fit. To free more workspace and read bigger chunks, jump to an earlier checkpoint before trying again.`,
+          text: recommendedLines <= 0
+            ? `Read is too large for available workspace; no line fits. Jump now, then read smaller chunks.`
+            : `Read is too large for available workspace, only ${recommendedLines} lines would fit. To free more workspace and read bigger chunks, jump to an earlier checkpoint before trying again.`,
         }],
         details: {},
       };
@@ -1549,6 +1936,29 @@ ${checkpointListForInterruption(ctx)}`;
       ? config.maxToolOutputTokens
       : Math.min(Math.max(0, workspaceTokens), config.maxToolOutputTokens);
     pendingToolOutputs.set(id, output);
+    if (pageBudget <= 0) {
+      // Workspace is exhausted. The full result stays buffered in memory, but a
+      // multi-line notice would add tokens to an already saturated context on
+      // every tool round; keep the shortest actionable directive instead.
+      triggerHardInterruption(ctx, true);
+      // No "keep the payload brief" hint here on purpose. A short payload under
+      // output pressure turns a recoverable stall into a lossy jump that throws
+      // away everything accumulated since the target; the objective is to never
+      // reach this state, not to negotiate it badly. Output room is guaranteed
+      // by `outputMarginFloorTokens` instead.
+      // If even the jump payload cannot fit, the session is genuinely over the
+      // ceiling and recovery is manual: pi's `/tree` navigates back to a safe
+      // point and summarizes the abandoned path in its own model call. VC
+      // deliberately does not automate that (see ANALYSIS-output-margin.md).
+      return {
+        content: [{
+          type: "text" as const,
+          text: `[0-token budget: jump now. Output retained as ID ${id}.]`,
+        }],
+        details: { outputId: id, totalLines: lineCount },
+      };
+    }
+
     const pageNotice = (pageLines: number) =>
       `Large tool output was paginated; showing lines 1-${pageLines} of ${lineCount}`;
     const firstPage = outputPageWithinBudget(output, id, 1, pageBudget, pageNotice);
@@ -1585,6 +1995,7 @@ ${checkpointListForInterruption(ctx)}`;
   });
   pi.on("turn_start", (_event, ctx) => {
     turnInProgress = true;
+    interruptionDispatchedThisTurn = false;
     const before = pressureState();
     evaluatePressure(ctx);
     logInterceptor("turn_start", { before, after: pressureState() });
@@ -1675,6 +2086,9 @@ ${checkpointListForInterruption(ctx)}`;
   });
   pi.on("message_end", (event, ctx) => {
     if (event.message.role !== "assistant") return;
+    // An empty assistant turn (provider error, or output clamped to nothing) is
+    // not progress: it means the interruption could not be acted on.
+    if (assistantMessageHasOutput(event.message)) noteAssistantProgress("assistant_output");
     for (const part of Array.isArray(event.message.content) ? event.message.content : []) {
       if (part?.type === "toolCall") {
         inspectStreamedCheckpointJump(part.name, part.arguments, part.id, ctx);
@@ -1695,6 +2109,7 @@ ${checkpointListForInterruption(ctx)}`;
     });
   });
   pi.on("tool_call", async (event, ctx) => {
+    noteAssistantProgress("tool_call");
     const before = pressureState();
     if (CHECKPOINT_JUMP_TOOL_NAMES.includes(event.toolName as (typeof CHECKPOINT_JUMP_TOOL_NAMES)[number])) {
       checkpointJumpCallInProgress = true;
@@ -1728,7 +2143,7 @@ ${checkpointListForInterruption(ctx)}`;
           ? { lineLimit: Math.max(0, Math.trunc(readInput.limit)) }
           : {}),
       };
-      const workspaceTokens = retrievalWorkspaceTokens(ctx);
+      const workspaceTokens = advisoryWorkspaceTokens(ctx);
       if (workspaceTokens === null) return;
       const { estimatedTokens } = await estimateReadFileStats(file, ctx.signal);
       if (estimatedTokens <= workspaceTokens) return;
@@ -1844,6 +2259,13 @@ ${checkpointListForInterruption(ctx)}`;
     return messages === event.messages ? undefined : { messages };
   });
 
+  // Hard pressure means the agent owes a checkpoint jump and its payload must
+  // still be produced. `hardFired` alone stays latched across an accepted jump
+  // that is waiting for context usage to drop, so gate output-margin behavior on
+  // the states that actually precede a forced-jump answer.
+  const hardPressureActive = (): boolean =>
+    !jumpPending && !postJumpTurnProtected && (hardFired || hardJumpPending || hardInterruptionPending);
+
   pi.on("before_provider_request", (event, ctx) => {
     if (pendingUserQueryCheckpointName) {
       const isInitial = pendingUserQueryCheckpointIsInitial;
@@ -1872,7 +2294,7 @@ ${checkpointListForInterruption(ctx)}`;
         });
       }
     }
-    if (!postJumpTurnProtected) return;
+    if (!postJumpTurnProtected && !hardPressureActive()) return;
     const asRecord = (value: unknown): Record<string, any> | undefined =>
       value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, any> : undefined;
     const payload = asRecord(event.payload);
@@ -1922,6 +2344,45 @@ ${checkpointListForInterruption(ctx)}`;
       lastMessageMatchesFollowupText: matchesFollowupText,
       lastMessageContentChars: lastText.length,
     });
+
+    // pi reserves a fixed 4096-token output margin before every request. At the
+    // hard threshold that reservation is pure loss: `retrievalWorkspaceTokens`
+    // is already at zero, so the remaining context belongs to the forced-jump
+    // answer — which runs with thinking disabled and therefore
+    // needs only answer tokens. When pi's margin drives max_tokens negative it
+    // clamps to 1, truncating the payload that is supposed to preserve the run.
+    // Raise the cap so the jump answer gets `outputMarginFloorTokens` instead.
+    if (config.outputMarginFloorTokens === null || !request || !hardPressureActive()) return;
+    const usage = ctx.getContextUsage();
+    const contextWindow = usage?.contextWindow ?? ctx.model?.maxTokens ?? 0;
+    if (contextWindow <= 0) return;
+    // The outgoing payload is the best estimate of input size for this request.
+    const serializedInput = JSON.stringify(messageList.length > 0 ? messageList : request);
+    const estimatedInputTokens = Math.max(usage?.tokens ?? 0, estimatePiTextTokens(serializedInput));
+    // pi resolves max_tokens/max_completion_tokens internally from provider and
+    // URL heuristics (getCompat), which this extension cannot observe; the field
+    // name is therefore decided after the request is built, by patching whichever
+    // cap the transport actually used.
+    const candidateFields = ["max_tokens", "max_completion_tokens"] as const;
+    const currentField = candidateFields.find((field) => typeof request[field] === "number"
+      && Number.isFinite(request[field]));
+    if (!currentField) return;
+    const currentCap = request[currentField] as number;
+    // pi's clamp: contextWindow - estimated input - CONTEXT_SAFETY_TOKENS(4096),
+    // floored at 1. Give the jump answer `outputMarginFloorTokens` instead.
+    const nextCap = Math.max(contextWindow - estimatedInputTokens - config.outputMarginFloorTokens, 256);
+    if (currentCap >= nextCap) return;
+    logInterceptor("hard_pressure_output_margin_raised", {
+      model: ctx.model?.id ?? null,
+      contextWindow,
+      estimatedInputTokens,
+      piMarginTokens: 4096,
+      floorTokens: config.outputMarginFloorTokens,
+      maxTokensField: currentField,
+      previousMaxTokens: currentCap,
+      nextMaxTokens: nextCap,
+    });
+    return { ...request, [currentField]: nextCap };
   });
 
   const readLoadoutOverride = {
@@ -1941,17 +2402,15 @@ ${checkpointListForInterruption(ctx)}`;
     if (!record) return textResult("No history node is available for a checkpoint.");
     return textResult(formatCheckpointLabel(record));
   };
-  for (const [name, label] of [["checkpoint_create", "Create checkpoint"], ["subagent_checkpoint_create", "Create subagent checkpoint"]] as const) {
-    pi.registerTool({
-      ...readLoadoutOverride,
-      name, label,
-      description: "Creates a new checkpoint to which you can jump after doing work.",
-      promptSnippet: "Create a checkpoint to which you can jump after doing work.",
-      promptGuidelines: ["Always create a checkpoint before large reads, before series of bash commands, after initial clarification of your assignment (what does the user actually want me to do)."],
-      parameters: createParams,
-      execute: createCheckpoint,
-    });
-  }
+  pi.registerTool({
+    ...readLoadoutOverride,
+    name: "checkpoint_create", label: "Create checkpoint",
+    description: "Creates a new checkpoint to which you can jump after doing work.",
+    promptSnippet: "Create a checkpoint to which you can jump after doing work.",
+    promptGuidelines: ["Always create a checkpoint before large reads, before series of bash commands, after initial clarification of your assignment (what does the user actually want me to do)."],
+    parameters: createParams,
+    execute: createCheckpoint,
+  });
 
   const listParams = Type.Object({ limit: Type.Optional(Type.Number({ description: "Maximum checkpoints to show (default: 50)." })) });
   pi.registerTool({
@@ -1971,55 +2430,102 @@ ${checkpointListForInterruption(ctx)}`;
     },
   });
 
+  // Shared parameter fragments so the headless contract can advertise the
+  // jump without the interaction-only task_completed parameter.
+  const jumpTargetParam = Type.Number({ multipleOf: 1, description: "Numeric checkpoint ID returned by checkpoint_create or shown by checkpoint_list; must always be the first parameter before payload." });
+  const jumpPayloadParam = Type.String({ description: "Payload that meticulously preserves all relevant knowledge acquired since the target checkpoint and includes planned next steps." });
   const jumpParams = Type.Object({
-    target: Type.Number({ multipleOf: 1, description: "Numeric checkpoint ID returned by checkpoint_create or shown by checkpoint_list; must always be the first parameter before payload." }),
-    payload: Type.String({ description: "Payload that meticulously preserves all relevant knowledge acquired since the target checkpoint and includes planned next steps." }),
+    target: jumpTargetParam,
+    payload: jumpPayloadParam,
     task_completed: Type.Optional(Type.Boolean({ description: "Use true only after you already reported task completion to the user." })),
   });
-  const subagentJumpParams = Type.Object({
-    target: Type.Number({ multipleOf: 1, description: "Numeric checkpoint ID returned by subagent_checkpoint_create." }),
-    payload: Type.String({ description: "Payload that meticulously preserves all relevant knowledge acquired since the target checkpoint and includes planned next steps." }),
-  });
+  const executeCheckpointJump = async (
+    _id: string,
+    params: { target: number; payload: string; task_completed?: boolean },
+    _signal: AbortSignal | undefined,
+    _update: ((update: any) => void) | undefined,
+    ctx: ExtensionContext,
+  ) => {
+    const sm = manager(ctx);
+    const target = resolveCheckpointId(sm, params.target);
+    if (!target) return textResult(`Checkpoint #${params.target} was not found. Use checkpoint_list to inspect available checkpoints.`);
+    // Keep hard-limit reasoning disabled until a target with enough workspace
+    // distance has been accepted.
+    if (!jumpTargetMeetsMinimumDistance(sm, params.target, ctx)) return invalidJumpTargetResult(ctx);
+    // Validate before clearing hard-pressure flags so a rejected forced jump
+    // keeps reasoning disabled until a suitable jump is accepted.
+    const payloadError = jumpPayloadError(params.payload);
+    if (payloadError) return textResult(payloadError);
+    const jumpNotice = checkpointJumpNotice(sm, params.target);
+    const leaf = sm.getLeafId();
+    const autoResume = hardJumpPending || hardInterruptionCancelledForJump;
+    if (leaf === target) {
+      return textResult(params.target === 0 ? "Already at checkpoint." : `Already at checkpoint [${params.target}].`);
+    }
+    const headless = isHeadlessSession(sm);
+    const taskCompleted = headless || autoResume ? false : (params.task_completed ?? false);
+    jumpPending = true;
+    cancelHardInterruptionForJump();
+    if (headless) {
+      // Do not terminate a headless session's prompt at the jump tool. The
+      // parent runner treats termination as the end of the invocation and can
+      // return an empty result before a deferred continuation is observed. The
+      // tool result already carries the payload, so let the model finish
+      // naturally.
+      pendingJump = { target, checkpointId: params.target, payload: params.payload, taskCompleted: false, subagent: true, autoResume };
+      return payloadResult(params.target === 0
+        ? "Checkpoint jump is pending while this headless session completes; payload retained."
+        : `Checkpoint jump to [${params.target}] is pending while this headless session completes; payload retained.`, params.payload);
+    }
+    pendingJump = { target, checkpointId: params.target, payload: params.payload, taskCompleted, subagent: false, autoResume };
+    return {
+      ...payloadResult(taskCompleted
+        ? params.target === 0
+          ? "Jump to checkpoint is pending after next user input."
+          : `Jump to checkpoint [${params.target}] is pending after next user input.`
+        : jumpNotice, params.payload),
+      terminate: true,
+    };
+  };
   pi.registerTool({
     ...readLoadoutOverride,
     name: "checkpoint_jump", label: "Jump to checkpoint",
-    description: "Jump to a checkpoint and continue with the supplied payload.",
+    description: "Jump to a checkpoint and continue with the supplied payload. The target id must always be the first parameter before payload.",
     promptSnippet: "Jump to a checkpoint after completing a unit of work; always include a relevant payload. Restores the workspace and conversation state to that of the target checkpoint.",
     promptGuidelines: ["Include relevant facts, decisions, completed actions, side effects, unresolved issues, and the next action in the payload."],
     parameters: jumpParams,
     renderCall(args, theme, context) { return renderJumpCall("checkpoint_jump", args, theme, context); },
     renderResult: renderJumpResult,
-    async execute(_id, params: Static<typeof jumpParams>, _signal, _update, ctx) {
-      const sm = manager(ctx);
-      const target = resolveCheckpointId(sm, params.target);
-      if (!target) return textResult(`Checkpoint #${params.target} was not found. Use checkpoint_list to inspect available checkpoints.`);
-      // Keep hard-limit reasoning disabled until a target with enough workspace
-      // distance has been accepted.
-      if (!jumpTargetMeetsMinimumDistance(sm, params.target, ctx)) return invalidJumpTargetResult(ctx);
-      // Validate before clearing hard-pressure flags so a rejected forced jump
-      // keeps reasoning disabled until a suitable jump is accepted.
-      const payloadError = jumpPayloadError(params.payload);
-      if (payloadError) return textResult(payloadError);
-      const jumpNotice = checkpointJumpNotice(sm, params.target);
-      const leaf = sm.getLeafId();
-      const autoResume = hardJumpPending || hardInterruptionCancelledForJump;
-      if (leaf === target) {
-        return textResult(params.target === 0 ? "Already at checkpoint." : `Already at checkpoint [${params.target}].`);
-      }
-      const taskCompleted = autoResume ? false : (params.task_completed ?? false);
-      jumpPending = true;
-      cancelHardInterruptionForJump();
-      pendingJump = { target, checkpointId: params.target, payload: params.payload, taskCompleted, subagent: false, autoResume };
-      return {
-        ...payloadResult(taskCompleted
-          ? params.target === 0
-            ? "Jump to checkpoint is pending after next user input."
-            : `Jump to checkpoint [${params.target}] is pending after next user input.`
-          : jumpNotice, params.payload),
-        terminate: true,
-      };
-    },
+    execute: executeCheckpointJump,
   });
+  // Headless sessions re-register the public tool names with the private
+  // variant contracts: interaction-only parameters such as task_completed are
+  // not advertised at all, and the post-jump continuation never waits for user
+  // input that a spawned session cannot supply.
+  function registerHeadlessToolContracts(): void {
+    pi.registerTool({
+      ...readLoadoutOverride,
+      name: "checkpoint_create", label: "Create checkpoint",
+      description: "Creates a new checkpoint to which you can jump after doing work.",
+      promptSnippet: "Create a checkpoint to which you can jump after doing work.",
+      promptGuidelines: ["Always create a checkpoint before large reads, before series of bash commands, after initial clarification of your assignment (what does the user actually want me to do)."],
+      parameters: createParams,
+      execute: createCheckpoint,
+    });
+    pi.registerTool({
+      ...readLoadoutOverride,
+      name: "checkpoint_jump", label: "Jump to checkpoint",
+      description: "Jump to a numeric checkpoint and continue with the supplied payload. The target id must always be the first parameter before payload.",
+      promptSnippet: "Jump to a checkpoint after completing a unit of work; always include a relevant payload.",
+      parameters: Type.Object({
+        target: Type.Number({ multipleOf: 1, description: "Numeric checkpoint ID returned by checkpoint_create." }),
+        payload: jumpPayloadParam,
+      }),
+      renderCall(args, theme, context) { return renderJumpCall("checkpoint_jump", args, theme, context); },
+      renderResult: renderJumpResult,
+      execute: executeCheckpointJump,
+    });
+  }
   const outputIdParam = Type.Number({ minimum: 1, multipleOf: 1, description: "Tool output ID returned with a large output's first chunk." });
   const receiveFullParams = Type.Object({ id: outputIdParam });
   pi.registerTool({
@@ -2032,7 +2538,7 @@ ${checkpointListForInterruption(ctx)}`;
     async execute(_toolCallId, params: Static<typeof receiveFullParams>, _signal, _update, ctx) {
       const output = pendingToolOutputs.get(params.id);
       if (!output) return textResult(`Requested output ID ${params.id} was not found.`);
-      const workspaceTokens = retrievalWorkspaceTokens(ctx);
+      const workspaceTokens = advisoryWorkspaceTokens(ctx);
       if (workspaceTokens === null) {
         return textResult(`Could not calculate available workspace for output ID ${params.id}. Jump to an earlier checkpoint before retrieving it.`);
       }
@@ -2063,7 +2569,7 @@ ${checkpointListForInterruption(ctx)}`;
       const output = pendingToolOutputs.get(params.id);
       if (!output) return textResult(`Requested output ID ${params.id} was not found.`);
       const offset = Math.max(1, Math.floor(params.offset));
-      const workspaceTokens = retrievalWorkspaceTokens(ctx);
+      const workspaceTokens = advisoryWorkspaceTokens(ctx);
       if (workspaceTokens === null) {
         return textResult(`Could not calculate available workspace for output ID ${params.id}. Jump to an earlier checkpoint before retrieving it.`);
       }
@@ -2106,35 +2612,6 @@ ${checkpointListForInterruption(ctx)}`;
     },
   });
 
-  pi.registerTool({
-    ...readLoadoutOverride,
-    name: "subagent_checkpoint_jump", label: "Jump to checkpoint as subagent",
-    description: "Jump to a numeric checkpoint and continue with the supplied payload.",
-    promptSnippet: "Jump to a checkpoint after completing a unit of work; always include a relevant payload.",
-    parameters: subagentJumpParams,
-    renderCall(args, theme, context) { return renderJumpCall("subagent_checkpoint_jump", args, theme, context); },
-    renderResult: renderJumpResult,
-    async execute(_id, params: Static<typeof subagentJumpParams>, _signal, _update, ctx) {
-      const sm = manager(ctx);
-      const target = resolveCheckpointId(sm, params.target);
-      if (!target) return textResult(`Checkpoint #${params.target} was not found. Use checkpoint_list to inspect available checkpoints.`);
-      if (!jumpTargetMeetsMinimumDistance(sm, params.target, ctx)) return invalidJumpTargetResult(ctx);
-      const payloadError = jumpPayloadError(params.payload);
-      if (payloadError) return textResult(payloadError);
-      if (sm.getLeafId() === target) return textResult(params.target === 0 ? "Already at checkpoint." : `Already at checkpoint [${params.target}].`);
-      jumpPending = true;
-      cancelHardInterruptionForJump();
-      // Do not terminate a subagent's prompt at the jump tool. The parent
-      // runner treats termination as the end of the invocation and can return
-      // an empty result before a deferred continuation is observed. The tool
-      // result already carries the payload, so let the model finish naturally.
-      pendingJump = { target, checkpointId: params.target, payload: params.payload, taskCompleted: false, subagent: true, autoResume: false };
-      return payloadResult(params.target === 0
-        ? "Checkpoint jump is pending while this subagent completes; payload retained."
-        : `Checkpoint jump to [${params.target}] is pending while this subagent completes; payload retained.`, params.payload);
-    },
-  });
-
   // Replace Pi's built-in bash tool. The built-in returns only the last 2,000
   // lines / 50 KB and names a temp file for the rest; voluntary compaction
   // accepts the complete output and paginates it against the live workspace.
@@ -2160,18 +2637,27 @@ ${checkpointListForInterruption(ctx)}`;
         evaluatePressure(ctx);
       }
       dispatchHardInterruption(ctx);
-      const forcedInterruption = pendingForcedJumpInterruption;
+      const forcedInterruptions = [
+        pendingForcedJumpInterruption,
+        hardLimitFollowupPending ? pendingHardLimitFollowup : null,
+      ].filter((text): text is string => typeof text === "string" && text.length > 0);
       pendingForcedJumpInterruption = null;
-      if (forcedInterruption) {
+      if (hardLimitFollowupPending) {
+        pendingHardLimitFollowup = null;
+        hardLimitFollowupPending = false;
+      }
+      if (forcedInterruptions.length > 0) {
         const deliverAfterAbort = (): void => {
           if (!ctx.isIdle()) {
             setTimeout(deliverAfterAbort, 25);
             return;
           }
-          try {
-            pi.sendUserMessage(forcedInterruption);
-          } catch (error) {
-            logInterceptor("invalid_checkpoint_jump_followup_failed", { error: String(error) });
+          for (const text of forcedInterruptions) {
+            try {
+              pi.sendUserMessage(text);
+            } catch (error) {
+              logInterceptor("forced_jump_followup_failed", { error: String(error) });
+            }
           }
         };
         setTimeout(deliverAfterAbort, 0);
@@ -2184,6 +2670,14 @@ ${checkpointListForInterruption(ctx)}`;
     hardInterruptionPending = false;
     hardJumpPending = false;
     assistantBumpPending = false;
+    if (hardLimitFollowupPending) {
+      // The aborted stream produced the accepted jump, or its continuation
+      // landed while the run settled; either way this branch already carries the
+      // required compaction, so drop the queued hard-limit follow-up.
+      pendingHardLimitFollowup = null;
+      hardLimitFollowupPending = false;
+      logInterceptor("hard_limit_followup_dropped_for_jump", pressureState());
+    }
 
     // agent_end can fire before Pi has finished persisting the terminating turn.
     // Defer first so the core loop can settle, then wait for idle before checking

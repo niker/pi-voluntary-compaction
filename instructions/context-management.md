@@ -22,8 +22,6 @@ Relevant tools are:
 - `output_receive_full`
 - `output_receive_paginate`
 
-You are not a subagent, do not use subagent tool variants.
-
 ### Before working on a task
 
 You must always create a fresh new checkpoint:

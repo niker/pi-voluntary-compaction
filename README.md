@@ -80,14 +80,6 @@ For emergencies, invisible checkpoint 0 marks the initial user query.
 - `checkpoint_jump` — jump to a checkpoint with a payload and continue. Set `task_completed: true` to stop and wait for user input. In interactive TUI mode this leaves a decision line above the editor; **Alt+C** toggles whether the jump is applied when the next message arrives. In pi-web sessions, use `/jump` or `/nojump` before the next real message to choose the pending decision; omitting either command keeps the configured default.
 
 
-### Subagents
-
-Subagents and headless agents must use this variant, that has stripped user-facing interaction, regular tools will return to main agent on jump.
-
-- `subagent_checkpoint_create` — checkpoint creation tool for subagents.
-- `subagent_checkpoint_jump` — jump tool for subagents.
-
-
 ### Tool output
 
 Large tool outputs receive numerical IDs and are session-bound.
