@@ -33,6 +33,33 @@ const INTERNAL_TOOLS = new Set([
   "checkpoint_create", "checkpoint_jump", "checkpoint_list",
 ]);
 const CHECKPOINT_JUMP_TOOL_NAMES = ["checkpoint_jump"] as const;
+// Tools whose execution writes files to disk. The model has already paid for the
+// full content in the assistant message before the tool runs, so an abort at any
+// point from the first streamed token of the call until its result is finalized
+// discards work that is already committed (bug14: a chapters.json write returned
+// "Operation aborted" and the file never existed). Hard pressure defers to these
+// calls and fires once the mutation is safely on disk.
+const FILE_MUTATING_TOOL_NAMES = ["write", "edit"] as const;
+
+// pi's fixed output margin, used when `outputMarginFloorTokens` is null.
+const PI_OUTPUT_MARGIN_TOKENS = 4096;
+
+// Tier-2 advisory injected once after the write that crossed the emergency
+// margin landed. Exact text: the model must not attempt another write.
+const EMERGENCY_WRITE_ADVISORY = "[The issued write was completed. Workspace utilization does not allow another write to be done safely. You must jump immediately!]";
+
+const isFileMutatingToolName = (toolName: unknown): boolean =>
+  FILE_MUTATING_TOOL_NAMES.includes(toolName as (typeof FILE_MUTATING_TOOL_NAMES)[number]);
+
+// Tool names stream incrementally, so a prefix cannot decide the tool yet.
+// true: a known mutating tool. false: a tool known not to mutate files.
+// null: the streamed name is still unresolved, so nothing is decided.
+const streamedMutationNameSignal = (toolName: unknown): boolean | null => {
+  if (typeof toolName !== "string" || !toolName) return null;
+  if (isFileMutatingToolName(toolName)) return true;
+  if (FILE_MUTATING_TOOL_NAMES.some((name) => name.startsWith(toolName))) return null;
+  return false;
+};
 // A headless session is a spawned child. The header's parentSession is
 // necessary but not sufficient: branched or forked main sessions inherit a
 // parentSession too, and server-hosted sessions report hasUI=false like
@@ -467,6 +494,18 @@ function retrievalWorkspaceTokens(ctx: ExtensionContext): number | null {
   return Math.floor(usage.contextWindow * config.hardThresholdPercent / 100 - tokens);
 }
 
+// Raw workspace left before the context window itself runs out. Unlike
+// retrievalWorkspaceTokens this ignores the hard threshold, so it keeps
+// counting down after pressure fires — a forced jump still has to fit in what
+// is actually left of the real window, not what is left below 85%.
+function ceilingWorkspaceTokens(ctx: ExtensionContext): number | null {
+  const usage = ctx.getContextUsage();
+  if (!usage || usage.contextWindow <= 0) return null;
+  const tokens = usage.tokens ?? (usage.percent == null ? null : usage.percent / 100 * usage.contextWindow);
+  if (tokens == null || !Number.isFinite(tokens)) return null;
+  return Math.floor(usage.contextWindow - tokens);
+}
+
 // Budget quoted to the agent in retrieval/read sizing hints. Unlike raw
 // workspace it reserves the reasoning buffer (the model's next reasoning turn
 // plus the follow-up pagination call) and an envelope sliver for the page
@@ -642,7 +681,10 @@ function checkpointJumpNotice(sm: SessionManager, id: number): string {
   // Application is deferred until this turn ends (or until queued input resumes
   // the run), so nothing is freed yet when this notice is produced; and the
   // figure is the target's utilisation when it was recorded, not a live reading.
-  return `[${notice}; workspace will be cleared to ${generosity}${formatted}% utilization.]`;
+  // The string is past tense regardless: it is only ever read after the jump
+  // lands, once the agent has lost the pre-jump turn, and a task_completed jump
+  // is committed by the next action unless the human specifically opts out.
+  return `[${notice}; workspace has been cleared to ${generosity}${formatted}% utilization.]`;
 }
 
 function nextCheckpointId(sm: SessionManager): number {
@@ -776,7 +818,7 @@ function loadHeadlessAgentInstructions(fallback: string | null): string | null {
 const CONFIG_KEYS: (keyof Config)[] = [
   "softThresholdPercent", "hardThresholdPercent", "workspaceReasoningBufferPercent", "maxToolOutputTokens", "minimumJumpDistance", "softMessage",
   "hardReasoningMessage", "hardNonReasoningMessage", "instructions",
-  "advertiseVoluntaryCompaction", "afterTaskCompaction", "outputMarginFloorTokens",
+  "advertiseVoluntaryCompaction", "afterTaskCompaction", "outputMarginFloorTokens", "emergencyWriteMargin",
 ];
 type ConfigOverrides = Partial<Config>;
 
@@ -804,7 +846,10 @@ function validConfig(value: any): value is Config {
     && (value.outputMarginFloorTokens === null
       || (Number.isSafeInteger(value.outputMarginFloorTokens)
         && value.outputMarginFloorTokens >= 256
-        && value.outputMarginFloorTokens <= 8192));
+        && value.outputMarginFloorTokens <= 8192)
+    && Number.isSafeInteger(value.emergencyWriteMargin)
+    && value.emergencyWriteMargin >= 0
+    && value.emergencyWriteMargin <= 32768);
 }
 
 function validOverrides(value: any): value is ConfigOverrides {
@@ -821,6 +866,9 @@ function validOverrides(value: any): value is ConfigOverrides {
     if (key === "outputMarginFloorTokens") {
       return item === null
         || (typeof item === "number" && Number.isSafeInteger(item) && item >= 256 && item <= 8192);
+    }
+    if (key === "emergencyWriteMargin") {
+      return typeof item === "number" && Number.isSafeInteger(item) && item >= 0 && item <= 32768;
     }
     if (key.endsWith("Message")) return typeof item === "string";
     return typeof item === "number" && Number.isFinite(item) && item >= 0 && item <= 100;
@@ -896,12 +944,13 @@ const SETTING_DESCRIPTIONS: Record<keyof Config, string> = {
   maxToolOutputTokens: "Maximum estimated token size for a single non-read tool output before it is paginated. Checkpoint and pagination tools are excluded.",
   minimumJumpDistance: "The minimum workspace utilization difference for a checkpoint jump to be valid when the target is above the soft threshold. Range: 0-100%.",
   softMessage: "Message sent to the model at the soft threshold. Use it to explain how the model should prepare before context becomes critical.",
-  hardReasoningMessage: "Synthetic assistant message appended for reasoning models at the hard threshold to interrupt active reasoning and force checkpoint return.",
-  hardNonReasoningMessage: "Urgent message sent to non-reasoning models at the hard threshold. It asks for immediate checkpoint return.",
+  hardReasoningMessage: "Emergency hard notice, used only inside the emergency zone — once usage has eaten into the buffer a reasoning-free jump payload needs. Reaching it forces thinking off; the <think> block stands in for the reasoning that interruption removes.",
+  hardNonReasoningMessage: "Hard notice sent while thinking stays enabled. One line demanding an immediate checkpoint jump, with no synthetic thinking block.",
   instructions: "Instructions appended to the system prompt. The package Markdown is used when this is set to the default (null); custom text replaces it.",
   advertiseVoluntaryCompaction: "Controls whether checkpoint and voluntary-compaction instructions are advertised in the system prompt. Pressure warnings and tools remain active when disabled.",
   afterTaskCompaction: "Default decision shown after the agent requests task compaction. Alt+C toggles it in the TUI; pi-web provides /jump and /nojump commands before the next message applies it.",
   outputMarginFloorTokens: "Output tokens reserved for the forced-jump answer when workspace is exhausted at the hard threshold, replacing pi's fixed 4096-token margin. Default 256 keeps only a safety sliver because tool-output interception already bounds oversized results. Set to null (empty) to keep pi's behavior. Range: 256-8192.",
+  emergencyWriteMargin: "Raw retrieval workspace (tokens still below the hard threshold) at which an open write/edit batch stops being deferred. The write already in flight is saved, then pressure fires immediately so the jump payload keeps room; the break happens at this margin plus the forced-jump output floor. Default 3000. Range: 0-32768.",
 };
 
 export default function (pi: ExtensionAPI): void {
@@ -919,6 +968,19 @@ export default function (pi: ExtensionAPI): void {
   // interruption holds thinking off. The manual choice wins over the captured value.
   let userChoseThinkingLevelDuringHardOff = false;
   const activeToolCalls = new Set<string>();
+  // File mutations the model has committed but that are not on disk yet: either
+  // still streaming into the assistant message, or executing. A hard interruption
+  // must never abort while this window is open.
+  const fileMutationToolCallIds = new Set<string>();
+  let fileMutationStreaming = false;
+  // A batch is the run of consecutive assistant messages that carry write/edit
+  // calls. The model splits one plan across several of them, so firing between
+  // two write messages aborts its own plan and it re-emits the same content
+  // (bug15: two files written twice, then a third round of writes, all before any
+  // jump). The batch stays open across messages and closes at the first message
+  // that carries no mutation; pressure waits for that.
+  let fileMutationBatchOpen = false;
+  let fileMutationBatchMessages = 0;
   let checkpointJumpCallInProgress = false;
   let checkpointJumpNamePending = false;
   let invalidJumpInterruptionTriggered = false;
@@ -938,6 +1000,15 @@ export default function (pi: ExtensionAPI): void {
   // Latched while an abort-at-hard-limit continuation is owed, so agent_end can
   // deliver or discard it exactly once.
   let hardLimitFollowupPending = false;
+  // One aborted stream can re-arm pressure before its queued follow-up lands:
+  // pi opens another turn while the aborted stream settles, `turn_start` clears
+  // the per-turn dispatch guard and the exhausted-retrieval evaluator force-
+  // re-latches, so the abort branch runs a second time for the same abort and
+  // reports it twice (bug20: two identical "hard limit aborted" error lines and
+  // only one "Operation aborted" pair). Report the abort once per episode; the
+  // latch resets when its follow-up is delivered or discarded, when pressure is
+  // relieved, and whenever compaction completes.
+  let hardLimitAbortNotified = false;
   // Hard interruptions injected since the assistant last produced any output or
   // tool call. A resumed session can already be over the provider's context
   // window: every request fails instantly and leaves an empty assistant turn,
@@ -1018,6 +1089,27 @@ export default function (pi: ExtensionAPI): void {
     };
   };
 
+  // The emergency zone: usage has eaten into the buffer a forced jump needs when
+  // no reasoning is emitted, so every further token lowers the chance the payload
+  // lands. One zone, two perils with the same answer — an open write batch stops
+  // being deferred (bug16 reached 93.9% with no room left for the jump), and
+  // thinking is traded for tokens. The committed write still lands first.
+  let emergencyWorkspaceBreak = false;
+  let emergencyWriteBreakPending = false;
+  // Whether the last evaluated hard interruption traded thinking for tokens: the
+  // forced thinking level and the notice variant must always agree, and the next
+  // repro log has to show which pair a given injection used.
+  let hardThinkingBumpActive = false;
+  // The hard notice must warn against another write whenever the tool call that
+  // completed just before it was a write/edit. bug17 missed the advisory because
+  // the old latch could only arm inside the deferral branch, while the pressure
+  // in that session arrived after the write had already landed.
+  let lastToolCallWasFileMutation = false;
+  // Measured in raw retrieval tokens; the forced-jump answer needs its own output
+  // floor on top of the margin (`outputMarginFloorTokens`, or pi's fixed margin).
+  const emergencyWriteThresholdTokens = (): number =>
+    config.emergencyWriteMargin + (config.outputMarginFloorTokens ?? PI_OUTPUT_MARGIN_TOKENS);
+
   const pressureState = () => ({
     checkpointJumpCallInProgress,
     checkpointJumpNamePending,
@@ -1026,7 +1118,119 @@ export default function (pi: ExtensionAPI): void {
     hardInterruptionCancelledForJump,
     jumpPending,
     hardLimitFollowupPending,
+    fileMutationStreaming,
+    executingFileMutations: [...fileMutationToolCallIds],
+    fileMutationBatchOpen,
+    fileMutationBatchMessages,
+    emergencyWorkspaceBreak,
+    emergencyWriteBreakPending,
+    lastToolCallWasFileMutation,
+    emergencyWriteThreshold: emergencyWriteThresholdTokens(),
+    hardThinkingBumpActive,
   });
+
+  // True from the first streamed token of a write/edit tool call until that call
+  // is finalized. The streaming flag latches for the whole assistant message once
+  // any mutation appears: aborting mid-stream truncates the remaining tool calls
+  // too, so the batch is already committed and must be allowed to run.
+  const fileMutationQueued = (): boolean =>
+    fileMutationStreaming || fileMutationToolCallIds.size > 0;
+
+  // Safety valve for a write loop that never stops: after this many consecutive
+  // mutation messages pressure fires again, but only once the current message's
+  // calls are on disk, so the cap can never discard a committed write.
+  const MAX_FILE_MUTATION_BATCH_MESSAGES = 4;
+
+  const fileMutationBatchDefers = (): boolean =>
+    fileMutationBatchOpen && fileMutationBatchMessages < MAX_FILE_MUTATION_BATCH_MESSAGES;
+
+  // Recomputed from live usage. The zone is measured from the context window
+  // ceiling, not from the hard threshold: `contextWindow - (margin + output
+  // floor)` tokens of real room left is the last point where a payload composed
+  // without reasoning still fits, so the zone is entered after ordinary pressure
+  // fired, only if the session kept spending past it.
+  const noteEmergencyWorkspace = (ctx: ExtensionContext): boolean => {
+    const ceiling = ceilingWorkspaceTokens(ctx);
+    emergencyWorkspaceBreak = ceiling !== null && ceiling <= emergencyWriteThresholdTokens();
+    return emergencyWorkspaceBreak;
+  };
+
+  // A checkpoint_jump already visible in the stream is composing its payload.
+  // That answer must finish, so it is never the moment to trade thinking away:
+  // disabling thinking mid-payload saves nothing the jump still needs.
+  const jumpPayloadInFlight = (): boolean =>
+    jumpPending || checkpointJumpCallInProgress || checkpointJumpNamePending;
+
+  // Experimental: ordinary hard steering leaves thinking alone, so the model
+  // keeps reasoning while it composes the jump payload and gets the plain
+  // one-line directive — a synthetic `<think>` block would add tokens to a turn
+  // that is already thinking. Inside the emergency zone the two perils are one
+  // peril — an ongoing write, or thinking, eating the room a forced jump needs —
+  // so they get one answer: interrupt, force thinking off, drop the notice and
+  // pray the buffer is large enough. A model with no reasoning support never
+  // gets either: disabling thinking would be a no-op and the wrapper would only
+  // be echoed.
+  const hardThinkingBumpArmed = (ctx: ExtensionContext): boolean => {
+    // One shared reading, so the write guard and this escalation can never
+    // disagree about how much room is left — and the forced level always pairs
+    // with the notice variant that replaces the reasoning it removes.
+    hardThinkingBumpActive = !jumpPayloadInFlight()
+      && ctx.model?.reasoning === true
+      && noteEmergencyWorkspace(ctx);
+    return hardThinkingBumpActive;
+  };
+
+  // Queued work must reach disk. An open batch may finish only while there is
+  // still room for another write plus the forced-jump answer; inside the
+  // emergency zone the batch closes as soon as the current write lands.
+  const fileMutationInFlight = (ctx: ExtensionContext): boolean =>
+    fileMutationQueued() || (!noteEmergencyWorkspace(ctx) && fileMutationBatchDefers());
+
+  const noteStreamedToolName = (toolName: unknown): void => {
+    if (streamedMutationNameSignal(toolName)) fileMutationStreaming = true;
+  };
+
+  const noteStreamedMessageContent = (message: any): void => {
+    for (const part of Array.isArray(message?.content) ? message.content : []) {
+      if (part?.type === "toolCall") noteStreamedToolName(part.name);
+    }
+  };
+
+  // The message is final: the guard now belongs to its tool calls themselves,
+  // which register in `tool_call` and release on `tool_execution_end`. A
+  // mutation message opens (or extends) the batch; any other message closes it,
+  // which is the safe point where pressure may fire again.
+  const noteFinalAssistantMessage = (message: any): void => {
+    const hasMutation = (Array.isArray(message?.content) ? message.content : [])
+      .some((part: any) => part?.type === "toolCall" && isFileMutatingToolName(part.name));
+    fileMutationStreaming = hasMutation;
+    if (hasMutation) {
+      fileMutationBatchOpen = true;
+      fileMutationBatchMessages += 1;
+    } else {
+      fileMutationBatchOpen = false;
+      fileMutationBatchMessages = 0;
+    }
+  };
+
+  const releaseFileMutation = (toolCallId: string): void => {
+    fileMutationToolCallIds.delete(toolCallId);
+    if (fileMutationToolCallIds.size === 0) fileMutationStreaming = false;
+  };
+
+  // Start of an assistant message: the previous message's calls are all finalized
+  // by now, so drop their bookkeeping. The batch deliberately survives this reset,
+  // because the model's write batch spans several messages.
+  const resetFileMutationMessageState = (): void => {
+    fileMutationToolCallIds.clear();
+    fileMutationStreaming = false;
+  };
+
+  const clearFileMutationTracking = (): void => {
+    resetFileMutationMessageState();
+    fileMutationBatchOpen = false;
+    fileMutationBatchMessages = 0;
+  };
 
   const renderCompactionOffer = (ctx: ExtensionContext): void => {
     if (!ctx.hasUI || !pendingJumpOffer) return;
@@ -1071,6 +1275,11 @@ export default function (pi: ExtensionAPI): void {
     hardInterruptionCancelledForJump = false;
     postJumpTurnProtected = true;
     assistantBumpPending = false;
+    // The aborted stream that led here already got its report; the continuation
+    // this jump starts is a fresh episode.
+    hardLimitAbortNotified = false;
+    emergencyWriteBreakPending = false;
+    lastToolCallWasFileMutation = false;
     restoreHardThinking();
   };
 
@@ -1262,6 +1471,7 @@ export default function (pi: ExtensionAPI): void {
         ["advertiseVoluntaryCompaction", "Advertise voluntary compaction"],
         ["afterTaskCompaction", "After task compaction default"],
         ["outputMarginFloorTokens", "Forced-jump output floor"],
+        ["emergencyWriteMargin", "Emergency write margin"],
       ];
 
       while (true) {
@@ -1327,6 +1537,19 @@ export default function (pi: ExtensionAPI): void {
             continue;
           }
           edited.outputMarginFloorTokens = number;
+          editedKeys.add(key);
+          continue;
+        }
+
+        if (key === "emergencyWriteMargin") {
+          const value = await ctx.ui.editor(`Edit ${selected}\n\n${description}`, String(edited.emergencyWriteMargin));
+          if (value == null) continue;
+          const number = Number(value.trim());
+          if (!Number.isSafeInteger(number) || number < 0 || number > 32768) {
+            ctx.ui.notify("Emergency write margin must be a whole number between 0 and 32768 tokens.", "error");
+            continue;
+          }
+          edited.emergencyWriteMargin = number;
           editedKeys.add(key);
           continue;
         }
@@ -1399,6 +1622,44 @@ export default function (pi: ExtensionAPI): void {
       }
     },
   });
+
+  // Force thinking off for a hard interruption and capture the level it replaces.
+  // The capture belongs here, not only in `triggerHardInterruption`: every dispatch
+  // path can run after a restore cleared `hardThinkingPrevious` — a checkpoint jump
+  // that cancelled the interruption, or the user picking a level while this extension
+  // holds "off". A forced off without a capture leaves no hint entry either, so
+  // `restoreHardThinking()` has nothing to restore and the artificial "off" outlives
+  // the interruption (bug18: an entire post-jump branch ran with thinking disabled).
+  const forceThinkingOff = (): void => {
+    let captured: ReturnType<ExtensionAPI["getThinkingLevel"]> | null = null;
+    if (hardThinkingPrevious === null) {
+      try {
+        captured = pi.getThinkingLevel();
+      } catch {
+        // The runtime may be shutting down or switching sessions.
+      }
+      // Capturing "off" would only schedule a no-op restore, and it would claim the
+      // slot that a later real level needs. A user who runs with thinking off stays
+      // off after the interruption, which is what they configured.
+      if (captured !== null && captured !== "off") {
+        hardThinkingPrevious = captured;
+        userChoseThinkingLevelDuringHardOff = false;
+      } else {
+        captured = null;
+      }
+    }
+    pi.setThinkingLevel("off");
+    if (captured !== null) {
+      // pi's own entry records only the artificial off, so persist the level it
+      // replaced for crash recovery. Appending after the forced off is what lets
+      // `recoverableForcedThinkingLevel` treat a later user change as newer.
+      try {
+        pi.appendEntry(THINKING_HINT_ENTRY_TYPE, { thinkingLevel: captured });
+      } catch {
+        // A session that cannot append entries simply cannot recover the level.
+      }
+    }
+  };
 
   const restoreHardThinking = () => {
     const previous = hardThinkingPrevious;
@@ -1540,10 +1801,12 @@ export default function (pi: ExtensionAPI): void {
     restoreHardThinking();
   };
 
-  // Two injections give the model two chances to emit checkpoint_jump. A third
-  // can only help if the assistant answered in between; otherwise it keeps
-  // feeding a context that can no longer answer.
-  const MAX_HARD_INTERRUPTIONS_WITHOUT_PROGRESS = 2;
+  // Three injections give the model three chances to emit checkpoint_jump. A
+  // fourth can only help if the assistant answered in between; otherwise it keeps
+  // feeding a context that can no longer answer. The count must stay above the
+  // interruptions a re-latch produces as a side effect, so recovering from a
+  // deferred batch does not surface the stall warning.
+  const MAX_HARD_INTERRUPTIONS_WITHOUT_PROGRESS = 3;
 
   // Any assistant output or tool call proves the model can still act on a hard
   // interruption, so pressure may inject again.
@@ -1599,8 +1862,39 @@ export default function (pi: ExtensionAPI): void {
       logInterceptor("hard_interruption_deferred_for_partial_name", pressureState());
       return;
     }
+    // A committed write/edit must reach the disk first, and a write batch must
+    // finish before pressure interrupts it. pi checks the abort signal right after
+    // `beforeToolCall` (this extension's tool_call handler) returns, so aborting
+    // here replaced the mutation with an "Operation aborted" error result and the
+    // file was never written (bug14); firing between two write messages instead
+    // made the model rewrite the same files (bug15). Pressure stays pending: the
+    // batch's last tool_execution_end, turn_end or agent_end fires it once the
+    // batch closes or the batch cap is reached.
+    if (fileMutationInFlight(ctx)) {
+      // The write that entered the emergency zone must be reported as unsafe
+      // once it lands, so the follow-up injection carries the advisory.
+      if (emergencyWorkspaceBreak && fileMutationQueued()) emergencyWriteBreakPending = true;
+      logInterceptor("hard_interruption_deferred_for_file_mutation", {
+        activeToolCallCount: activeToolCalls.size,
+        queuedMutations: fileMutationQueued(),
+        ...pressureState(),
+      });
+      return;
+    }
     logInterceptor("hard_interruption_dispatch_attempt", pressureState());
-    const message = `${ctx.model?.reasoning === true ? config.hardReasoningMessage : config.hardNonReasoningMessage}
+    // Consumed here so the advisory appears exactly once, attached to the hard
+    // notice that follows the dangerous write.
+    // Armed by the deferral that held pressure back and by a write/edit that
+    // completed just before this notice; consumed here so it appears once.
+    const emergencyAdvisory = emergencyWriteBreakPending || lastToolCallWasFileMutation
+      ? `${EMERGENCY_WRITE_ADVISORY}\n\n`
+      : "";
+    emergencyWriteBreakPending = false;
+    lastToolCallWasFileMutation = false;
+    // The notice variant and the thinking level must agree: the `<think>` block
+    // only stands in for reasoning that this dispatch actually removes.
+    const bumpThinking = hardThinkingBumpArmed(ctx);
+    const message = `${emergencyAdvisory}${bumpThinking ? config.hardReasoningMessage : config.hardNonReasoningMessage}
 
 Available checkpoints (use one of these IDs; do not call checkpoint_list):
 ${checkpointListForInterruption(ctx)}`;
@@ -1616,14 +1910,27 @@ ${checkpointListForInterruption(ctx)}`;
     const retrieval = retrievalWorkspaceTokens(ctx);
     if (turnInProgress && !ctx.isIdle() && retrieval !== null && retrieval <= 0) {
       try {
-        pi.setThinkingLevel("off");
+        // Exhausted retrieval alone no longer trades thinking for tokens: only
+        // a bump armed inside the emergency zone does. The abort stays
+        // unconditional — it is what leaves room for the jump payload.
+        if (bumpThinking) forceThinkingOff();
         hardInterruptionPending = false;
         pendingHardLimitFollowup = message;
         hardLimitFollowupPending = true;
         ctx.abort();
-        logInterceptor("hard_interruption_aborted_stream", { retrievalWorkspaceTokens: retrieval, ...pressureState() });
+        logInterceptor("hard_interruption_aborted_stream", {
+          retrievalWorkspaceTokens: retrieval,
+          abortNoticeAlreadyShown: hardLimitAbortNotified,
+          thinkingBump: bumpThinking,
+          ...pressureState(),
+        });
         noteHardInterruptionInjected(ctx, "abort");
-        if (ctx.hasUI) ctx.ui.notify(`pi-voluntary-compaction: hard limit aborted the active turn (${config.hardThresholdPercent}%)`, "error");
+        // Keep the first report of this abort. A re-latched dispatch in the same
+        // settle would repeat it verbatim while adding no information.
+        if (ctx.hasUI && !hardLimitAbortNotified) {
+          hardLimitAbortNotified = true;
+          ctx.ui.notify(`pi-voluntary-compaction: hard limit aborted the active turn (${config.hardThresholdPercent}%)`, "error");
+        }
       } catch (error) {
         pendingHardLimitFollowup = null;
         hardLimitFollowupPending = false;
@@ -1637,8 +1944,10 @@ ${checkpointListForInterruption(ctx)}`;
       // Re-apply this immediately before dispatching. The runtime can prepare
       // the next turn after turn_end and overwrite the level set earlier.
       // hardThinkingPrevious is retained so checkpoint completion restores the
-      // user's original level.
-      pi.setThinkingLevel("off");
+      // user's original level. Ordinary pressure no longer trades thinking for
+      // tokens; only usage inside the emergency zone forces the off this notice
+      // expects.
+      if (bumpThinking) forceThinkingOff();
       // Preserve immediate interruption in every case except a checkpoint
       // jump already visible in the streamed assistant response.
       pi.sendUserMessage(message, { deliverAs: ctx.isIdle() ? "followUp" : "steer" });
@@ -1669,20 +1978,10 @@ ${checkpointListForInterruption(ctx)}`;
     if (hardFired && !force) return;
     if (force && (jumpPending || postJumpTurnProtected)) return;
     try {
-      if (hardThinkingPrevious === null) {
-        const captured = pi.getThinkingLevel();
-        userChoseThinkingLevelDuringHardOff = false;
-        hardThinkingPrevious = captured;
-        pi.setThinkingLevel("off");
-        // pi's own entry records only the artificial off, so persist the level it
-        // replaced for crash recovery. Appending after the forced off is what lets
-        // `recoverableForcedThinkingLevel` treat a later user change as newer.
-        try {
-          pi.appendEntry(THINKING_HINT_ENTRY_TYPE, { thinkingLevel: captured });
-        } catch {
-          // A session that cannot append entries simply cannot recover the level.
-        }
-      }
+      // Triggering only latches pressure; dispatch re-checks the same predicate,
+      // so the forced level and the notice variant can never disagree. Forcing
+      // off here would disable thinking for a payload that is already streaming.
+      if (hardThinkingBumpArmed(ctx)) forceThinkingOff();
       hardJumpPending = true;
       hardInterruptionPending = true;
       hardFired = true;
@@ -1722,6 +2021,16 @@ ${checkpointListForInterruption(ctx)}`;
       // answered while usage was high.
       interruptionsSinceAssistantProgress = 0;
       hardInterruptionStalled = false;
+      hardLimitAbortNotified = false;
+      // An emergency advisory armed by a write that never got its interruption
+      // (the turn was cancelled, or /tree rewound to an earlier node) must not
+      // claim "no further write is safe" in a branch that has room again. Only
+      // clear it once usage is back outside the emergency zone, so a session
+      // still inside the zone keeps its armed advisory.
+      const reliefCeiling = ceilingWorkspaceTokens(ctx);
+      if (reliefCeiling === null || reliefCeiling > emergencyWriteThresholdTokens()) {
+        emergencyWriteBreakPending = false;
+      }
     }
     if (percent < config.softThresholdPercent) return;
     // Retrieval workspace is exhausted once tokens reach the configured hard
@@ -1729,8 +2038,18 @@ ${checkpointListForInterruption(ctx)}`;
     // is reserved inside sizing hints, not here).
     const retrieval = retrievalWorkspaceTokens(ctx);
     const exhausted = retrieval !== null && retrieval <= 0;
+    const emergency = noteEmergencyWorkspace(ctx);
     if (percent >= config.hardThresholdPercent || exhausted) {
       triggerHardInterruption(ctx, exhausted);
+      return;
+    }
+    // Emergency arming: the zone sits past the hard threshold, so this normally
+    // re-arms pressure that already fired and whose dispatch the in-flight write
+    // is holding back. It also covers a usage figure that crosses the whole band
+    // in one tool result (bug16 ended at 93.9%). Either way the mutation reaches
+    // disk first — what the zone closes is the deferral, never the write.
+    if (emergency && fileMutationQueued()) {
+      triggerHardInterruption(ctx, true);
       return;
     }
     if (!softFired) {
@@ -1764,6 +2083,7 @@ ${checkpointListForInterruption(ctx)}`;
     hardInterruptionCancelledForJump = false;
     assistantBumpPending = false;
     activeToolCalls.clear();
+    clearFileMutationTracking();
     checkpointJumpCallInProgress = false;
     checkpointJumpNamePending = false;
     turnInProgress = false;
@@ -1778,9 +2098,14 @@ ${checkpointListForInterruption(ctx)}`;
     pendingForcedJumpInterruption = null;
     pendingHardLimitFollowup = null;
     hardLimitFollowupPending = false;
+    hardLimitAbortNotified = false;
     interruptionsSinceAssistantProgress = 0;
     hardInterruptionStalled = false;
     interruptionDispatchedThisTurn = false;
+    emergencyWorkspaceBreak = false;
+    emergencyWriteBreakPending = false;
+    hardThinkingBumpActive = false;
+    lastToolCallWasFileMutation = false;
     clearJumpOffer(ctx);
     interceptorLogPath = null;
     interceptorLogSequence = 0;
@@ -2010,6 +2335,7 @@ ${checkpointListForInterruption(ctx)}`;
     checkpointJumpCallInProgress = false;
     checkpointJumpNamePending = false;
     invalidJumpInterruptionTriggered = false;
+    resetFileMutationMessageState();
     logInterceptor("message_start", { message: summarizeMessageShape(event.message), ...pressureState() });
   });
   pi.on("message_update", (event, ctx) => {
@@ -2051,6 +2377,10 @@ ${checkpointListForInterruption(ctx)}`;
       checkpointJumpCallInProgress = state === "jump";
       checkpointJumpNamePending = state === "unknown";
     }
+    // Partial snapshots are not guaranteed to retain toolCall parts, so observe
+    // both the delta's tool name and whatever the partial message exposes.
+    noteStreamedMessageContent(partial);
+    if (observedToolName != null) noteStreamedToolName(observedToolName);
     inspectStreamedCheckpointJump(
       observedToolName ?? observedToolCall?.name,
       observedToolCall?.arguments,
@@ -2094,6 +2424,7 @@ ${checkpointListForInterruption(ctx)}`;
         inspectStreamedCheckpointJump(part.name, part.arguments, part.id, ctx);
       }
     }
+    noteFinalAssistantMessage(event.message);
     const before = pressureState();
     const state = checkpointJumpStreamState(event.message, true);
     checkpointJumpCallInProgress = state === "jump";
@@ -2118,6 +2449,9 @@ ${checkpointListForInterruption(ctx)}`;
       checkpointJumpCallInProgress = false;
       checkpointJumpNamePending = false;
     }
+    // Register before evaluating pressure: this handler is pi's `beforeToolCall`,
+    // and the mutation must be tracked before any abort can be taken.
+    if (isFileMutatingToolName(event.toolName)) fileMutationToolCallIds.add(event.toolCallId);
     evaluatePressure(ctx);
     const dispatchRequested = hardInterruptionPending && !checkpointJumpCallInProgress;
     if (dispatchRequested) dispatchHardInterruption(ctx);
@@ -2169,6 +2503,7 @@ ${checkpointListForInterruption(ctx)}`;
   pi.on("tool_execution_start", (event, ctx) => {
     const before = pressureState();
     activeToolCalls.add(event.toolCallId);
+    if (isFileMutatingToolName(event.toolName)) fileMutationToolCallIds.add(event.toolCallId);
     if (CHECKPOINT_JUMP_TOOL_NAMES.includes(event.toolName as (typeof CHECKPOINT_JUMP_TOOL_NAMES)[number])) {
       checkpointJumpCallInProgress = true;
       checkpointJumpNamePending = false;
@@ -2184,6 +2519,27 @@ ${checkpointListForInterruption(ctx)}`;
   });
   pi.on("tool_execution_end", (event, ctx) => {
     activeToolCalls.delete(event.toolCallId);
+    // Any completed tool call decides what the next hard notice may claim: only a
+    // write/edit that just reached disk makes "the issued write was completed" and
+    // "no further write is safe" true, so any other tool clears the arming.
+    lastToolCallWasFileMutation = isFileMutatingToolName(event.toolName);
+    // This event fires after the tool finalized, so a mutation here is on disk.
+    // Release the guard and let the deferred interruption fire as soon as no other
+    // tool call is running and the batch is over - an open batch keeps deferring,
+    // and only the batch cap may fire here. Aborting now would cancel a sibling.
+    if (isFileMutatingToolName(event.toolName)) {
+      releaseFileMutation(event.toolCallId);
+      if (!fileMutationInFlight(ctx) && activeToolCalls.size === 0
+        && hardInterruptionPending && !checkpointJumpCallInProgress && !checkpointJumpNamePending) {
+        logInterceptor("hard_interruption_released_after_file_mutation", {
+          toolName: event.toolName,
+          toolCallId: event.toolCallId,
+          isError: event.isError,
+          ...pressureState(),
+        });
+        dispatchHardInterruption(ctx);
+      }
+    }
     if (CHECKPOINT_JUMP_TOOL_NAMES.includes(event.toolName as (typeof CHECKPOINT_JUMP_TOOL_NAMES)[number])) {
       logInterceptor("tool_execution_end", {
         toolName: event.toolName,
@@ -2209,6 +2565,7 @@ ${checkpointListForInterruption(ctx)}`;
     // below is the synchronization point for the follow-up, so only release
     // the bookkeeping guard here.
     activeToolCalls.clear();
+    clearFileMutationTracking();
   });
   pi.on("agent_settled", () => {
     logInterceptor("agent_settled", { activeToolCallCount: activeToolCalls.size, ...pressureState() });
@@ -2216,6 +2573,7 @@ ${checkpointListForInterruption(ctx)}`;
     // lifecycle hook only for defensive tool bookkeeping; it must not delay
     // the interruption until the agent is settled.
     activeToolCalls.clear();
+    clearFileMutationTracking();
   });
   pi.on("turn_end", (_event, ctx) => {
     const before = pressureState();
@@ -2228,6 +2586,13 @@ ${checkpointListForInterruption(ctx)}`;
       dispatchHardInterruption(ctx);
     }
     postJumpTurnProtected = false;
+    // The arming is scoped to the write that produced it, not to one turn. A batch
+    // deferral keeps pressure pending across this boundary (bug19: the batch guard
+    // was still open here, so the notice fired in the next turn), and wiping the
+    // arming unconditionally left every post-write hard notice without the advisory
+    // — 0 of 120 injections carried it. Any later completed tool overwrites the flag
+    // in `tool_execution_end`, so a stale arming cannot outlive its write.
+    if (!hardInterruptionPending) lastToolCallWasFileMutation = false;
     logInterceptor("turn_end", { before, after: pressureState() });
   });
 
@@ -2645,6 +3010,9 @@ ${checkpointListForInterruption(ctx)}`;
       if (hardLimitFollowupPending) {
         pendingHardLimitFollowup = null;
         hardLimitFollowupPending = false;
+        // The episode is over once its continuation is in the queue: a later
+        // abort must report itself again.
+        hardLimitAbortNotified = false;
       }
       if (forcedInterruptions.length > 0) {
         const deliverAfterAbort = (): void => {
@@ -2676,6 +3044,7 @@ ${checkpointListForInterruption(ctx)}`;
       // required compaction, so drop the queued hard-limit follow-up.
       pendingHardLimitFollowup = null;
       hardLimitFollowupPending = false;
+      hardLimitAbortNotified = false;
       logInterceptor("hard_limit_followup_dropped_for_jump", pressureState());
     }
 

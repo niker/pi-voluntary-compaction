@@ -48,6 +48,8 @@ Voluntary compaction lets the agent decide what is important and gives the agent
 The jump payload is not limited in size when done voluntarily.
 When the agent reaches a hard threshold of 80% context (configurable), the extension forces the agent to act immediately and jump with payload size up to 20% of context window.
 
+A forced interruption never discards work that the model has already paid for. When the threshold is crossed while `write`/`edit` calls are queued or running, the interruption waits for that batch to close, so every committed file reaches the disk first and pressure fires as soon as the last mutation is saved. Waiting is bounded: once the raw retrieval workspace falls to the emergency write margin plus the forced-jump output floor (default 3,000 tokens), the batch is closed after the in-flight write, and the interruption carries an advisory ordering an immediate jump instead of another write. Remaining files must then go into the jump payload.
+
 The strategy to prevent cumulative context degradation across multi-stage tasks:
 
 1. The agent establishes state anchor checkpoints (`checkpoint_create`) before initiating a potentially context-heavy operation.
@@ -96,6 +98,7 @@ You can configure pretty much everything important:
 - workspace reasoning buffer for automatic read/output retrieval sizing (default 5%, range 0-25%)
 - maximum estimated size for non-read tool output before pagination (default 8,000 tokens)
 - minimum workspace-utilization difference required for a checkpoint jump (default 7.5%)
+- emergency write margin — raw retrieval workspace at which an open `write`/`edit` batch stops being deferred (default 3,000 tokens, range 0-32,768)
 - soft/hard limit messages that steer the agent
 - built-in injected system prompt that teaches agent voluntary compaction
 - default jump allow/deny after task completion

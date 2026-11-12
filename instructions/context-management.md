@@ -1,7 +1,7 @@
 ## Workspace management
 
 This environment does not use context compaction but a combination of agent-managed checkpoints and large output interception.
-Default rules for managing your context are now suspended; context was replaced with a high-level abstraction in this environment - the Workspace. 
+Default rules for managing your context are now replaced; context was replaced by a high-level abstraction in this environment - the Workspace. 
 
 Tools you use will dynamically guide you to properly manage your workspace - diligently follow notices in sqare brackets at the last line of tool output.
 
@@ -22,16 +22,28 @@ Relevant tools are:
 - `output_receive_full`
 - `output_receive_paginate`
 
-### Before working on a task
+### Checkpoint creation
 
 You must always create a fresh new checkpoint:
 
 - immediately before the first read of a large file (then jump back to it between chunks; create a new one only after landing on a jump payload, to lock in accumulated knowledge)
 - immediately before every curl call or website download
-- immediately after receiving a jump payload - to lock-in the payload
-- immediately after the task assignment was clarified (like mapping coarse project structure, reading supplemental MD files)
+- immediately after the task assignment was clarified (mapping coarse project structure, reading supplemental files that clarify what the task actually is)
 
-Always prefer to use MCP tools in code mode if available, especially when searching or listing tools.
+You may create a checkpoint:
+
+- immediately after receiving a jump payload - to lock-in the payload permanently
+
+
+### Checkpoint jumps
+
+You must always jump to an earlier checkpoint unless ordered otherwise:
+
+- when ordered unconditionally
+- on logical task boundary (hard pivot)
+- after a messy exploratory task (distillation)
+- after processing large output data (files, tools)
+- on heavy workspace pressure (>100%)
 
 
 ## Processing of large files and outputs
@@ -86,4 +98,5 @@ When the received payload is large and contained information is all relevant, yo
 - Do not be conservative when sizing file `read` chunks regardless of workspace use, use a generous amount of lines when chunking (150-300); trust the guidance notices provided after using tools.
 - Your jumps should target suitable checkpoints below 40% utilization, but try to select checkpoints with most locked-in payloads.
 - Creating a checkpoint after a large read without jumping first makes no sense.
+- Always prefer to use MCP tools in code mode if available, especially when searching or listing tools.
 

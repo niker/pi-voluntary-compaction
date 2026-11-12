@@ -23,6 +23,20 @@ export type Config = {
    * pi's behavior. Range: 256-8192.
    */
   outputMarginFloorTokens: number | null;
+  /**
+   * Buffer that a forced jump payload must fit in when no reasoning is emitted:
+   * this margin plus the forced-jump output floor (`outputMarginFloorTokens`, or
+   * pi's fixed 4096-token margin when that key is null). It defines the emergency
+   * zone — usage at or above `contextWindow - buffer` leaves only this much real
+   * room for the jump, so past it every extra token rapidly lowers the chance the
+   * payload lands. Inside the zone an open write/edit batch stops being deferred
+   * (the committed call still reaches disk) and thinking is forced off in favour
+   * of the reasoning-model notice: an ongoing write and thinking before a jump
+   * put it in jeopardy the same way, so both get the same answer. Unlike every
+   * other threshold this one is measured from the context window ceiling, not
+   * from the hard percent. Default 3000. Range: 0-32768.
+   */
+  emergencyWriteMargin: number;
 };
 
 export const DEFAULT_CONFIG: Config = {
@@ -47,6 +61,7 @@ export const DEFAULT_CONFIG: Config = {
   advertiseVoluntaryCompaction: true,
   afterTaskCompaction: "allowed",
   outputMarginFloorTokens: 256,
+  emergencyWriteMargin: 3000,
 };
 
 export const config: Config = { ...DEFAULT_CONFIG };

@@ -28,7 +28,7 @@ const MAX_FULL_OUTPUT_BYTES = 64 * 1024 * 1024;
 /** Status lines that Pi appends after the command output. */
 const STATUS_SUFFIX = /\n\n(Command exited with code -?\d+|Command terminated without an exit code|Command aborted|Command timed out after [\d.]+ seconds)$/;
 
-const BASH_DESCRIPTION = "Execute a bash command in the current working directory. Returns stdout and stderr. Output is not truncated; oversized output is intercepted by voluntary compaction and paginated. Optionally provide a timeout in seconds.";
+const BASH_DESCRIPTION = "Execute a bash command in the current working directory. Returns stdout and stderr. Output is never truncated; oversized output will offer pagination. Optionally provide a timeout in seconds.";
 
 type ContentPart = { type: string; text?: string };
 type ShellResult = { content: ContentPart[]; details?: any; structuredContent?: unknown; isError?: boolean };
