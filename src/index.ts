@@ -48,6 +48,12 @@ const PI_OUTPUT_MARGIN_TOKENS = 4096;
 // margin landed. Exact text: the model must not attempt another write.
 const EMERGENCY_WRITE_ADVISORY = "[The issued write was completed. Workspace utilization does not allow another write to be done safely. You must jump immediately!]";
 
+// Injected instead when the mutation never ran at all: a streamed write/edit whose
+// growing arguments projected the prompt into the emergency zone is aborted before
+// its tool call can execute, so no file changed and the composed content is gone.
+// The model must not re-emit that content — it must spend what is left on the jump.
+const EMERGENCY_STREAM_ABORT_ADVISORY = "[The streamed write/edit was interrupted BEFORE it ran: nothing was written to disk and the content you were composing is discarded. Do not rewrite that file. Emit checkpoint_jump now, with no prose and no reasoning, using one of the listed checkpoint IDs.]";
+
 const isFileMutatingToolName = (toolName: unknown): boolean =>
   FILE_MUTATING_TOOL_NAMES.includes(toolName as (typeof FILE_MUTATING_TOOL_NAMES)[number]);
 
@@ -489,9 +495,195 @@ function workspaceUsedPercent(ctx: ExtensionContext): number | null {
 function retrievalWorkspaceTokens(ctx: ExtensionContext): number | null {
   const usage = ctx.getContextUsage();
   if (!usage || usage.contextWindow <= 0) return null;
-  const tokens = usage.tokens ?? (usage.percent == null ? null : usage.percent / 100 * usage.contextWindow);
+  // The same structure-aware figure the emergency zone and the output margin are
+  // measured against. pi's chars/4 count cannot tell that a tool result is C
+  // source or JSON, so it quotes retrieval pages that are too big and lets the
+  // workspace look unexhausted after reality already is; when nothing can be
+  // measured the reported figure stands in.
+  const reported = usage.tokens ?? (usage.percent == null ? null : usage.percent / 100 * usage.contextWindow);
+  const measured = measuredContextTokens(ctx);
+  const tokens = measured != null && Number.isFinite(measured) ? measured : reported;
   if (tokens == null || !Number.isFinite(tokens)) return null;
   return Math.floor(usage.contextWindow * config.hardThresholdPercent / 100 - tokens);
+}
+
+// pi reports context usage as a structure-blind chars/4 count over the message
+// list (`estimateContextTokens`, core/compaction), anchoring its projection on the
+// last trustworthy assistant response and charging everything appended after it the
+// same crude way. Chars/4 has no idea what the text is: C sources, JSON tool args
+// and a 17k-character edit payload tokenize far denser than prose, so a session
+// like bug1's is under-counted and the emergency zone opens later than it really
+// did. The span after a fresh anchor is short — every response advances it, which
+// is why bug1's per-turn drift stayed in the hundreds — but it is the whole context
+// whenever usage cannot be anchored at all (after a compaction or context edit) and
+// whenever an outgoing request is sized from a full serialization of the message
+// list, which is how bug1's raised output cap collapsed to its 256-token floor.
+// So measure with the enhanced estimator used everywhere else
+// (src/output-stream.ts), anchored on the provider's own reported total for the
+// last response — exact, tool schemas and wire framing included — and take every
+// emergency decision against one boundary:
+// `contextWindow - (emergencyWriteMargin + forced-jump output floor)` evaluated on
+// the best figure available at that instant.
+function reportedUsageTokens(message: unknown): number | null {
+  if (!message || typeof message !== "object" || Array.isArray(message)) return null;
+  const record = message as Record<string, any>;
+  if (record.role !== "assistant" || !record.usage) return null;
+  // Aborted and error responses never describe the context they were sent into.
+  if (record.stopReason === "aborted" || record.stopReason === "error") return null;
+  const usage = record.usage as Record<string, unknown>;
+  const count = (value: unknown): number =>
+    typeof value === "number" && Number.isFinite(value) ? value : 0;
+  const tokens = count(usage.totalTokens)
+    || count(usage.input) + count(usage.output) + count(usage.cacheRead) + count(usage.cacheWrite);
+  return tokens > 0 ? tokens : null;
+}
+
+function projectedMessageTokens(message: unknown): number {
+  if (!message || typeof message !== "object" || Array.isArray(message)) return 0;
+  const content = (message as Record<string, any>).content;
+  // System and other string-bodied entries; estimatePiMessageTokens assumes arrays.
+  if (typeof content === "string") return estimatePiTextTokens(content);
+  return estimatePiMessageTokens(message as Message);
+}
+
+// Read through a local shape: pi >= 1.x resolves a per-entry projection, older
+// builds only the flat message list. Both are supported, and neither is assumed.
+type ContextMessageSource = {
+  buildSessionProjection?: () => { messages?: unknown[] };
+  buildSessionContext: () => { messages?: unknown[] };
+  getBranch: () => Array<{ id?: string; type?: string }>;
+};
+
+// Mirrors pi's staleness rule without needing a message-to-entry mapping: usage is
+// only trustworthy when some assistant answered after the latest compaction or
+// context edit, because anything recorded earlier describes a context that no
+// longer exists. The anchor is the last usage-bearing message, so "any usage after
+// the invalidator" and "the anchor entry is after the invalidator" are equivalent.
+function reportedUsageIsStale(branch: Array<{ id?: string; type?: string }>): boolean {
+  let invalidatorIndex = -1;
+  for (let index = branch.length - 1; index >= 0; index -= 1) {
+    const type = branch[index]?.type;
+    if (type === "context_edit" || type === "compaction") {
+      invalidatorIndex = index;
+      break;
+    }
+  }
+  return !branch.slice(invalidatorIndex + 1).some((entry) =>
+    entry?.type === "message"
+    && reportedUsageTokens((entry as Record<string, any>).message) !== null);
+}
+
+// The figure plus whether it is anchored. An anchored measurement is exact up to
+// the anchor because the provider itself counted the system prompt, the tool
+// schemas and the request framing there; only the span after it is estimated, so
+// pi's structure-blind count cannot improve on it. Without an anchor the whole
+// visible context is estimated and pi's figure survives only as a floor.
+type ContextMeasurement = { tokens: number; anchored: boolean };
+
+function measureSessionContextTokens(ctx: ExtensionContext): ContextMeasurement | null {
+  const sm = manager(ctx) as unknown as ContextMessageSource;
+  const projected = typeof sm.buildSessionProjection === "function"
+    ? sm.buildSessionProjection()
+    : null;
+  const messages = Array.isArray(projected?.messages)
+    ? projected.messages
+    : (sm.buildSessionContext()?.messages ?? []);
+
+  let anchorIndex = -1;
+  let anchorTokens = 0;
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const reported = reportedUsageTokens(messages[index]);
+    if (reported !== null) {
+      anchorIndex = index;
+      anchorTokens = reported;
+      break;
+    }
+  }
+
+  if (anchorIndex >= 0 && reportedUsageIsStale(sm.getBranch() ?? [])) {
+    anchorIndex = -1;
+    anchorTokens = 0;
+  }
+
+  if (anchorIndex < 0) {
+    // Nothing to trust: charge the whole visible context, counting the current
+    // system message once — pi's fallback shape with the better estimator.
+    let currentSystem: unknown;
+    for (const message of messages) {
+      if ((message as Record<string, any> | null)?.role === "system") currentSystem = message;
+    }
+    let tokens = currentSystem ? projectedMessageTokens(currentSystem) : 0;
+    for (const message of messages) {
+      if ((message as Record<string, any> | null)?.role !== "system") {
+        tokens += projectedMessageTokens(message);
+      }
+    }
+    return { tokens, anchored: false };
+  }
+
+  let tokens = anchorTokens;
+  for (let index = anchorIndex + 1; index < messages.length; index += 1) {
+    tokens += projectedMessageTokens(messages[index]);
+  }
+  return { tokens, anchored: true };
+}
+
+// The streaming assistant message is not in the projection yet — pi persists a
+// message at `message_end` — so this figure is exactly what the next provider
+// request will carry, and a partially composed tool call is added on top of it by
+// the caller that measures the stream. Cached per session shape: the figure only
+// changes when an entry lands, never between chunks of one message.
+let measuredContextCache: { key: string; tokens: number | null } = { key: "", tokens: null };
+
+// The two figures behind the cached measurement, surfaced in every pressure dump:
+// pi's structure-blind chars/4 count over the message list, and the figure this
+// extension actually decides on. Their difference is the drift a code- or
+// JSON-heavy session hides in the crude count — and it is what a future provider
+// tokenizer plugged into `estimateTokensSafe` would close.
+let lastContextMeasurement: {
+  tokens: number | null;
+  piChars4Tokens: number | null;
+  anchored: boolean;
+} = { tokens: null, piChars4Tokens: null, anchored: false };
+
+function measuredContextTokens(ctx: ExtensionContext): number | null {
+  const usage = ctx.getContextUsage();
+  // pi reports `tokens: null` when no post-compaction response exists yet; that
+  // unknown state must stay unknown here rather than become an estimate.
+  if (!usage || usage.contextWindow <= 0 || usage.tokens == null) return null;
+  const sm = manager(ctx);
+  let key: string;
+  try {
+    key = `${sm.getSessionId()}:${sm.getLeafId()}:${sm.getBranch().length}`;
+  } catch {
+    return usage.tokens ?? null;
+  }
+  if (measuredContextCache.key !== key) {
+    let measured: ContextMeasurement | null;
+    try {
+      measured = measureSessionContextTokens(ctx);
+    } catch {
+      measured = null;
+    }
+    const reported = usage.tokens ?? 0;
+    // The enhanced estimator owns the decision wherever it can see the text, so
+    // `estimateTokensSafe` stays the single place to correct how code, JSON and
+    // prose are counted. pi's chars/4 figure only survives as a floor when the
+    // measurement is unanchored: an anchored one already carries the provider's
+    // exact total, and a structure-blind count can only pull it off target.
+    const tokens = measured == null
+      ? (usage.tokens ?? null)
+      : measured.anchored
+        ? measured.tokens
+        : Math.max(measured.tokens, reported);
+    lastContextMeasurement = {
+      tokens,
+      piChars4Tokens: reported,
+      anchored: measured?.anchored ?? false,
+    };
+    measuredContextCache = { key, tokens };
+  }
+  return measuredContextCache.tokens;
 }
 
 // Raw workspace left before the context window itself runs out. Unlike
@@ -501,7 +693,7 @@ function retrievalWorkspaceTokens(ctx: ExtensionContext): number | null {
 function ceilingWorkspaceTokens(ctx: ExtensionContext): number | null {
   const usage = ctx.getContextUsage();
   if (!usage || usage.contextWindow <= 0) return null;
-  const tokens = usage.tokens ?? (usage.percent == null ? null : usage.percent / 100 * usage.contextWindow);
+  const tokens = measuredContextTokens(ctx);
   if (tokens == null || !Number.isFinite(tokens)) return null;
   return Math.floor(usage.contextWindow - tokens);
 }
@@ -981,6 +1173,13 @@ export default function (pi: ExtensionAPI): void {
   // that carries no mutation; pressure waits for that.
   let fileMutationBatchOpen = false;
   let fileMutationBatchMessages = 0;
+  // Latched once a streamed mutation has been interrupted for projecting into the
+  // emergency zone, so one stream is aborted exactly once. Resets with the message.
+  let streamedMutationInterrupted = false;
+  // Set by that abort: its partial tool call never executed, so the truncated
+  // final message must not reopen the write batch or hold pressure back. Consumed
+  // by `noteFinalAssistantMessage`.
+  let streamAbortedForEmergency = false;
   let checkpointJumpCallInProgress = false;
   let checkpointJumpNamePending = false;
   let invalidJumpInterruptionTriggered = false;
@@ -1122,11 +1321,16 @@ export default function (pi: ExtensionAPI): void {
     executingFileMutations: [...fileMutationToolCallIds],
     fileMutationBatchOpen,
     fileMutationBatchMessages,
+    streamedMutationInterrupted,
+    streamAbortedForEmergency,
     emergencyWorkspaceBreak,
     emergencyWriteBreakPending,
     lastToolCallWasFileMutation,
     emergencyWriteThreshold: emergencyWriteThresholdTokens(),
     hardThinkingBumpActive,
+    contextTokens: lastContextMeasurement.tokens,
+    piChars4Tokens: lastContextMeasurement.piChars4Tokens,
+    contextAnchoredOnUsage: lastContextMeasurement.anchored,
   });
 
   // True from the first streamed token of a write/edit tool call until that call
@@ -1155,6 +1359,16 @@ export default function (pi: ExtensionAPI): void {
     return emergencyWorkspaceBreak;
   };
 
+  // True while real room remains above the emergency line, `contextWindow -
+  // (emergencyWriteMargin + forced-jump output floor)`. Nothing here predicts what
+  // the next turn will cost: the stream is measured against that line as it grows
+  // (`interruptStreamedFileMutation`), so an oversized edit may start freely and
+  // is cut off the instant it crosses. This gate only decides whether pressure
+  // waits for a safe point; inside the zone it must not wait, because the turn it
+  // would wait for is the one that has to carry the jump payload (bug1).
+  const fileMutationRoomForAnotherWrite = (ctx: ExtensionContext): boolean =>
+    !noteEmergencyWorkspace(ctx);
+
   // A checkpoint_jump already visible in the stream is composing its payload.
   // That answer must finish, so it is never the moment to trade thinking away:
   // disabling thinking mid-payload saves nothing the jump still needs.
@@ -1180,11 +1394,13 @@ export default function (pi: ExtensionAPI): void {
     return hardThinkingBumpActive;
   };
 
-  // Queued work must reach disk. An open batch may finish only while there is
-  // still room for another write plus the forced-jump answer; inside the
-  // emergency zone the batch closes as soon as the current write lands.
+  // Queued work must reach disk. An open batch may finish only while real room
+  // remains above the emergency line; once the zone is entered the batch closes as
+  // soon as the current write lands. Closing the batch is never destructive: it
+  // only declines to let the *next* message start composing, and the follow-up
+  // notice tells the model to jump instead of re-emitting it (bug15).
   const fileMutationInFlight = (ctx: ExtensionContext): boolean =>
-    fileMutationQueued() || (!noteEmergencyWorkspace(ctx) && fileMutationBatchDefers());
+    fileMutationQueued() || (fileMutationRoomForAnotherWrite(ctx) && fileMutationBatchDefers());
 
   const noteStreamedToolName = (toolName: unknown): void => {
     if (streamedMutationNameSignal(toolName)) fileMutationStreaming = true;
@@ -1201,6 +1417,16 @@ export default function (pi: ExtensionAPI): void {
   // mutation message opens (or extends) the batch; any other message closes it,
   // which is the safe point where pressure may fire again.
   const noteFinalAssistantMessage = (message: any): void => {
+    if (streamAbortedForEmergency) {
+      // The interrupted stream's tool call never executed: there is no mutation to
+      // protect, no batch to keep open, and pressure must be free to fire for the
+      // continuation that this abort queued.
+      streamAbortedForEmergency = false;
+      fileMutationStreaming = false;
+      fileMutationBatchOpen = false;
+      fileMutationBatchMessages = 0;
+      return;
+    }
     const hasMutation = (Array.isArray(message?.content) ? message.content : [])
       .some((part: any) => part?.type === "toolCall" && isFileMutatingToolName(part.name));
     fileMutationStreaming = hasMutation;
@@ -1224,6 +1450,7 @@ export default function (pi: ExtensionAPI): void {
   const resetFileMutationMessageState = (): void => {
     fileMutationToolCallIds.clear();
     fileMutationStreaming = false;
+    streamedMutationInterrupted = false;
   };
 
   const clearFileMutationTracking = (): void => {
@@ -1729,6 +1956,19 @@ export default function (pi: ExtensionAPI): void {
       formatCheckpointLabel(checkpoint, workspaceDelta)).join("\n");
   };
 
+  // The hard notice together with the checkpoint list it must carry. `advisory`
+  // is the emergency prefix when one is owed; `bumpThinking` must match the
+  // thinking level the dispatch actually removes, so the `<think>` block in the
+  // reasoning variant never lies about the reasoning it stands in for.
+  const hardInterruptionMessage = (
+    ctx: ExtensionContext,
+    advisory: string,
+    bumpThinking: boolean,
+  ): string => `${advisory}${bumpThinking ? config.hardReasoningMessage : config.hardNonReasoningMessage}
+
+Available checkpoints (use one of these IDs; do not call checkpoint_list):
+${checkpointListForInterruption(ctx)}`;
+
   const invalidJumpTargetResult = (ctx: ExtensionContext) => {
     if (ctx.hasUI) ctx.ui.notify("Checkpoint jump suppressed.", "warning");
     return textResult(`This checkpoint is invalid target, because the workspace utilization delta is too low.\n\nAvailable checkpoints (use one of these IDs; do not call checkpoint_list):\n${checkpointListForInterruption(ctx)}`);
@@ -1828,6 +2068,17 @@ export default function (pi: ExtensionAPI): void {
       || (part?.type === "thinking" && typeof part.thinking === "string" && part.thinking.trim().length > 0));
   };
 
+  // A checkpoint_jump that arrives without a usable target and payload frees no
+  // workspace, so under hard pressure it must not be read as progress. bug1's
+  // recovery spiral was this call repeated (`checkpoint_jump {}`), each attempt
+  // truncated by the output cap, each one re-arming the injector.
+  const inertHardPressureJumpCall = (toolName: string, input: unknown): boolean => {
+    if (!hardPressureActive()) return false;
+    if (!CHECKPOINT_JUMP_TOOL_NAMES.includes(toolName as (typeof CHECKPOINT_JUMP_TOOL_NAMES)[number])) return false;
+    const args = input as { target?: unknown; payload?: unknown } | undefined;
+    return args?.target === undefined || args?.payload === undefined;
+  };
+
   const noteHardInterruptionInjected = (ctx: ExtensionContext, via: string): void => {
     interruptionDispatchedThisTurn = true;
     interruptionsSinceAssistantProgress += 1;
@@ -1842,11 +2093,124 @@ export default function (pi: ExtensionAPI): void {
     }
   };
 
+  // A streamed write/edit is the one turn that can compose itself out of the
+  // window: provider-reported usage stays frozen while a stream runs, so the
+  // emergency zone is invisible until the call has already landed (bug1). Project
+  // the growing partial call against the real ceiling instead and interrupt the
+  // stream the moment it would enter the danger zone. pi runs tool calls only
+  // after the assistant message completes, so this discards a mutation that never
+  // touched disk — the distinction bug14 forced pressure to defer for. The rule is
+  // unconditional: whatever else is happening, an edit that enters the zone stops
+  // and hands what is left of the window to the forced jump.
+  const interruptStreamedFileMutation = (
+    ctx: ExtensionContext,
+    streamed: { name: unknown; message: any; args?: any },
+  ): void => {
+    // A stalled episode has already stopped injecting; aborting there would
+    // truncate a turn with no continuation to explain it. The output clamp and the
+    // terminal wall own that state instead.
+    if (streamedMutationInterrupted || hardInterruptionStalled) return;
+    if (jumpPayloadInFlight()) return;
+    let name = streamed.name;
+    let args = streamed.args;
+    if (name == null) {
+      // Cumulative runtimes carry the call only inside the partial message.
+      const parts = Array.isArray(streamed.message?.content) ? streamed.message.content : [];
+      for (let index = parts.length - 1; index >= 0; index -= 1) {
+        if (parts[index]?.type !== "toolCall") continue;
+        name = parts[index].name;
+        args = parts[index].arguments;
+        break;
+      }
+    }
+    // A streamed prefix ("e", "wr") cannot decide the tool yet.
+    if (!isFileMutatingToolName(name)) return;
+    const ceiling = ceilingWorkspaceTokens(ctx);
+    if (ceiling === null) return;
+    let composed = streamed.message
+      ? estimatePiMessageTokens(streamed.message as Message)
+      : 0;
+    if (!Number.isFinite(composed) || composed <= 0) {
+      // A delta runtime may not retain the accumulating message; the partial
+      // arguments are the bulk of a mutation turn anyway.
+      composed = args == null ? 0 : estimatePiTextTokens(JSON.stringify(args) ?? "");
+    }
+    const projected = ceiling - Math.max(0, composed);
+    if (projected > emergencyWriteThresholdTokens()) return;
+    streamedMutationInterrupted = true;
+    streamAbortedForEmergency = true;
+    // Judged on the projected figure: the frozen ceiling has not entered the zone
+    // yet precisely because this call is what would push it in, and the payload
+    // replacing it needs the room that reasoning would eat.
+    const bumpThinking = ctx.model?.reasoning === true;
+    const message = hardInterruptionMessage(ctx, `${EMERGENCY_STREAM_ABORT_ADVISORY}\n\n`, bumpThinking);
+    try {
+      if (bumpThinking) forceThinkingOff();
+      // The queued continuation replaces this dispatch; keeping both would inject
+      // the same demand twice.
+      hardInterruptionPending = false;
+      pendingHardLimitFollowup = message;
+      hardLimitFollowupPending = true;
+      ctx.abort();
+      logInterceptor("emergency_stream_mutation_aborted", {
+        toolName: String(name),
+        ceilingWorkspaceTokens: ceiling,
+        projectedCeilingWorkspaceTokens: projected,
+        composedTurnTokens: Math.max(0, composed),
+        thinkingBump: bumpThinking,
+        ...pressureState(),
+      });
+      noteHardInterruptionInjected(ctx, "stream_abort");
+      if (ctx.hasUI && !hardLimitAbortNotified) {
+        hardLimitAbortNotified = true;
+        ctx.ui.notify(`pi-voluntary-compaction: interrupted a ${String(name)} turn that entered the emergency zone (${config.hardThresholdPercent}%)`, "error");
+      }
+    } catch (error) {
+      // The stream survived the abort: let the call finish and fall back to the
+      // post-hoc pressure path, which still protects the committed write.
+      streamAbortedForEmergency = false;
+      pendingHardLimitFollowup = null;
+      hardLimitFollowupPending = false;
+      logInterceptor("emergency_stream_mutation_abort_failed", { error: String(error), ...pressureState() });
+    }
+  };
+
+  // Terminal state: so little of the window is left that no assistant answer —
+  // not even a minimal checkpoint_jump — can fit inside it. Injecting anyway is
+  // what turned bug1 into a spiral: ~30 notices, each answered at the output cap,
+  // ending in a provider 400 because the prompt itself passed the window. The
+  // stall warning already names the only real recovery (/tree), so latch it and
+  // say so once instead of feeding the prompt further.
+  const TERMINAL_ANSWER_RESERVE_TOKENS = 512;
+
+  const terminalCeilingReached = (ctx: ExtensionContext): boolean => {
+    if (config.outputMarginFloorTokens === null) return false;
+    const ceiling = ceilingWorkspaceTokens(ctx);
+    if (ceiling === null) return false;
+    return ceiling <= Math.max(config.outputMarginFloorTokens, TERMINAL_ANSWER_RESERVE_TOKENS);
+  };
+
+  // Returns true when pressure must stop here because the window is full. Notifies
+  // only on the transition into the stall, so a re-latch cannot repeat the toast.
+  const stallTerminalPressure = (ctx: ExtensionContext, via: string): boolean => {
+    if (!terminalCeilingReached(ctx)) return false;
+    hardInterruptionStalled = true;
+    logInterceptor("hard_interruption_stalled_terminal_ceiling", { via, ...pressureState() });
+    if (ctx.hasUI) {
+      ctx.ui.notify(
+        "pi-voluntary-compaction: the context window is full; injections stopped because no answer can fit. Recover with /tree, then continue.",
+        "warning",
+      );
+    }
+    return true;
+  };
+
   const dispatchHardInterruption = (ctx: ExtensionContext): void => {
     if (!hardInterruptionPending) return;
     // The model cannot answer at this context size; further injections only grow
     // a prompt the provider already rejected. Recovery is manual (pi's /tree).
     if (hardInterruptionStalled) return;
+    if (stallTerminalPressure(ctx, "dispatch")) return;
     if (interruptionDispatchedThisTurn) {
       logInterceptor("hard_interruption_suppressed_for_turn", pressureState());
       return;
@@ -1894,10 +2258,7 @@ export default function (pi: ExtensionAPI): void {
     // The notice variant and the thinking level must agree: the `<think>` block
     // only stands in for reasoning that this dispatch actually removes.
     const bumpThinking = hardThinkingBumpArmed(ctx);
-    const message = `${emergencyAdvisory}${bumpThinking ? config.hardReasoningMessage : config.hardNonReasoningMessage}
-
-Available checkpoints (use one of these IDs; do not call checkpoint_list):
-${checkpointListForInterruption(ctx)}`;
+    const message = hardInterruptionMessage(ctx, emergencyAdvisory, bumpThinking);
 
     // Ordinary hard steering is queued and lands at the next step boundary, so a
     // long assistant turn keeps adding output before pressure can act. Once
@@ -1973,8 +2334,10 @@ ${checkpointListForInterruption(ctx)}`;
   // percent to cross the hard threshold leaves no room to emit the jump.
   const triggerHardInterruption = (ctx: ExtensionContext, force = false) => {
     // A stalled interruption must not be re-armed by `force`: the assistant has
-    // not answered, so there is nothing new to interrupt.
+    // not answered, so there is nothing new to interrupt. A full window cannot be
+    // interrupted at all, forced or not.
     if (hardInterruptionStalled) return;
+    if (stallTerminalPressure(ctx, "trigger")) return;
     if (hardFired && !force) return;
     if (force && (jumpPending || postJumpTurnProtected)) return;
     try {
@@ -2106,6 +2469,7 @@ ${checkpointListForInterruption(ctx)}`;
     emergencyWriteBreakPending = false;
     hardThinkingBumpActive = false;
     lastToolCallWasFileMutation = false;
+    streamAbortedForEmergency = false;
     clearJumpOffer(ctx);
     interceptorLogPath = null;
     interceptorLogSequence = 0;
@@ -2387,6 +2751,14 @@ ${checkpointListForInterruption(ctx)}`;
       rawUpdate.id ?? observedToolCall?.id,
       ctx,
     );
+    // Projected-ceiling check, before pressure is evaluated: a write/edit that
+    // streams into the emergency zone must be interrupted while it is still only
+    // a stream, so nothing reaches disk and the jump keeps the room it needs.
+    interruptStreamedFileMutation(ctx, {
+      name: observedToolName ?? observedToolCall?.name ?? null,
+      message: partial,
+      args: observedToolCall?.arguments,
+    });
     // Re-check usage during streaming, after observing the partial tool name.
     // This lets us steer ordinary reasoning/output immediately while shielding
     // only a checkpoint_jump call whose name is already visible (or unresolved).
@@ -2417,8 +2789,12 @@ ${checkpointListForInterruption(ctx)}`;
   pi.on("message_end", (event, ctx) => {
     if (event.message.role !== "assistant") return;
     // An empty assistant turn (provider error, or output clamped to nothing) is
-    // not progress: it means the interruption could not be acted on.
-    if (assistantMessageHasOutput(event.message)) noteAssistantProgress("assistant_output");
+    // not progress: it means the interruption could not be acted on. Under hard
+    // pressure a turn cut off by the output cap is not progress either — prose
+    // that stops at `length` proves the model can talk, not that it emitted the
+    // jump (bug1 re-armed the injector ~30 times on truncated answers).
+    const truncatedUnderPressure = hardPressureActive() && event.message.stopReason === "length";
+    if (!truncatedUnderPressure && assistantMessageHasOutput(event.message)) noteAssistantProgress("assistant_output");
     for (const part of Array.isArray(event.message.content) ? event.message.content : []) {
       if (part?.type === "toolCall") {
         inspectStreamedCheckpointJump(part.name, part.arguments, part.id, ctx);
@@ -2440,7 +2816,8 @@ ${checkpointListForInterruption(ctx)}`;
     });
   });
   pi.on("tool_call", async (event, ctx) => {
-    noteAssistantProgress("tool_call");
+    // Only a call that can relieve pressure counts as progress.
+    if (!inertHardPressureJumpCall(event.toolName, event.input)) noteAssistantProgress("tool_call");
     const before = pressureState();
     if (CHECKPOINT_JUMP_TOOL_NAMES.includes(event.toolName as (typeof CHECKPOINT_JUMP_TOOL_NAMES)[number])) {
       checkpointJumpCallInProgress = true;
@@ -2721,9 +3098,17 @@ ${checkpointListForInterruption(ctx)}`;
     const usage = ctx.getContextUsage();
     const contextWindow = usage?.contextWindow ?? ctx.model?.maxTokens ?? 0;
     if (contextWindow <= 0) return;
-    // The outgoing payload is the best estimate of input size for this request.
-    const serializedInput = JSON.stringify(messageList.length > 0 ? messageList : request);
-    const estimatedInputTokens = Math.max(usage?.tokens ?? 0, estimatePiTextTokens(serializedInput));
+    // Size the input with the same figure the emergency zone is measured against:
+    // pi's reported usage for the shared prefix plus the enhanced estimator for
+    // everything appended after it. Serializing the whole outgoing list over-counts
+    // by its JSON framing, and that inflated figure drove the raised cap down to
+    // its 256 floor — which is how bug1's forced-jump answer received 256 tokens
+    // and could never carry a payload. Only when nothing can be measured does the
+    // raw request body stand in.
+    const measuredInputTokens = measuredContextTokens(ctx);
+    const estimatedInputTokens = measuredInputTokens != null && Number.isFinite(measuredInputTokens)
+      ? measuredInputTokens
+      : estimatePiTextTokens(JSON.stringify(messageList.length > 0 ? messageList : request));
     // pi resolves max_tokens/max_completion_tokens internally from provider and
     // URL heuristics (getCompat), which this extension cannot observe; the field
     // name is therefore decided after the request is built, by patching whichever
