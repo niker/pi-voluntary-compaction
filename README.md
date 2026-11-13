@@ -1,4 +1,4 @@
-# pi-voluntary-compaction - Agent-driven context management for Pi.
+# VC - Agent-driven context management for Pi.
 
 ## TL;DR - How does this work, is it yet another compaction plugin?
 
