@@ -55,8 +55,11 @@ The default settings are:
 | Emergency write margin | 3,000 tokens |
 
 **Soft limit** is only advisory, agent is informed it should wrap up any ongoing task and jump.
+
 **Hard limit** interrupts the agent unless it is actively writing, editing or jumping, but gives it a chance to reason before the jump.
+
 The **emergency zone** is the minimum amount of tokens required for a safe jump, any reasoning or write/edit is interrupted and the agent is forced to jump without reasoning.
+
 
 A successful jump has been observed at **94% use** of 72k context.
 In contrast regular compaction can sometimes fail (or worse - silently truncate) even at just 80% utilization.
