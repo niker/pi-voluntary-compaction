@@ -1,125 +1,100 @@
-# pi-voluntary-compaction
+# pi-voluntary-compaction - Agent-driven context management for Pi.
 
-## TL;DR
+## TL;DR - How does this work, is it yet another compaction plugin?
 
-Use one agent for a project - indefinitely. No handoff, no compaction.
+No. With VC installed compaction is never ever used again.
 
-Features:
-- One agent for a job, effectively unlimited context from users' point of view.
-- No compaction - agent only keeps what is currently relevant in context.
-- Ability to forget - agent can be ordered to forget information; hallucinations or wrong assumptions can be stripped from context (jump to #X and omit Y)
-- Near impossible to context choke - very large reads or tool output cannot kill the agent.
-- Higher workspace ceiling - for low context windows you can specify a hard size limit above the usual 75%. Default is 80% but up to 90% may be viable.
-- Unlimited file read sizes and tool output - PI's innate 50kb/2000lines limits are removed, agent can simply paginate over both as needed.
-- Low context windows are now viable - I prefer 72k as the sweet spot but lower would still be usable.
-- Safe multi-day workflows, see image below.
+Do you remember the cliché TV episode where the hero time-loops one day over and over? No matter what he does, he wakes up on the same morning over and over and he's the only one who remembers what happened before.
+
+This is basically how this plugin works, except the agent can drop anchors throughout the day and jump back in time to any of the anchors, with a bag that carries any thing or information needed to get the job done.
 
 
-Example - a RE job I have running now for about 3 days on Qwen (half at 27b via lm studio, half flash via strata).
-Notice the tokens in/out and context utilization:
+## TL;DR - My handoff files better
 
-<img width="727" height="234" alt="obrazek" src="https://github.com/user-attachments/assets/ebeb4982-a8ea-4038-a79f-918742010c32" />
+While a handoff to a new session may seem like a good idea, you are handing a documentation from an experienced senior to a fresh junior every time you do it.
 
+VC does not erase the conversation completely, only the parts the agent deems not important any more - and even so - any relevant parts of any size may be extracted by the agent and carried over.
 
-
-Here are results of a large book extraction benchmark that compares the same run on regular compaction and voluntary compaction:
-
-[Comparison Benchmark](./rc-vc-bench.md)
-
-Other benchmarks and judgements are up to you. Feel free to drop a line with your findings here on github.
-
----
-
-## Architecture
-
-This PI extesion operates as a harness-level agent-controlled garbage-collection mechanism.
-
-This allows even small and medium models to perform long-running complex tasks on huge amounts of data with `zero context rot`, `no classic compaction` and using relatively `small context length`.
+Plus it's fully transparent and automatic (no meat proxy), the agent decides what and when is important.
 
 
-Context **auto-compaction must be disabled** in settings for this extension to work correctly.
-
-It relies on two primary mechanics:
-
-### 1. Voluntary checkpointing and time-jumps
-
-Imagine the usual compaction as a lobotomy performed by third party. 
-Voluntary compaction lets the agent decide what is important and gives the agent time to outline a detailed plan for future self. 
-The jump payload is not limited in size when done voluntarily.
-When the agent reaches a hard threshold of 80% context (configurable), the extension forces the agent to act immediately and jump with payload size up to 20% of context window.
-
-A forced interruption never discards work that the model has already paid for. When the threshold is crossed while `write`/`edit` calls are queued or running, the interruption waits for that batch to close, so every committed file reaches the disk first and pressure fires as soon as the last mutation is saved. Waiting is bounded: once the raw retrieval workspace falls to the emergency write margin plus the forced-jump output floor (default 3,000 tokens), the batch is closed after the in-flight write, and the interruption carries an advisory ordering an immediate jump instead of another write. Remaining files must then go into the jump payload.
-
-The strategy to prevent cumulative context degradation across multi-stage tasks:
-
-1. The agent establishes state anchor checkpoints (`checkpoint_create`) before initiating a potentially context-heavy operation.
-2. Then executes tool calls, reads, performs complex reasoning or noisy shell commands.
-3. Upon task completion or a milestone, the agent decides what information is still relevant or needed to complete the task and prepares a minimal payload that it sends itself into the past via `checkpoint_jump`.
-4. The harness prunes all conversation between the checkpoint and current state, then hands the payload back to the agent to continue work.
-
-- 5a. The agent resumes work with all the necessary context and a plan. At worst it needs to re-read some files before edits.
-- 5b. If the agent jumped with information that the task is completed, control is given back to the user and waits for input. The user is presented with an option to `deny` the jump and continue the conversation without compaction - this is good for many simple low-latency tasks but not strictly necessary as the payload usually carries enough information to perform repeated tasks seamlessly. 
-   
-This strategy maintains optimal attention performance and low context utilization without losing high-level task focus.
+> **Before using VC:** turn off Pi's automatic compaction. VC manages the conversation instead. No compaction should ever run.
 
 
-### 2. Tool Output Interception
+## How it works
 
-This layer effectively prevents the model from choking itself on massive console output or website and allows it to seamlessly read files and consume shell output beyond the usual 2000-line/50kb limit of PI.
+### 1. Go back in time
 
-Tool output is intercepted before it enters the model's context when it exceeds the dynamic workspace (context remaining after the hard-threshold reserve and workspace reasoning buffer) or the configured maximum tool-output size (default 8,000 estimated tokens). `read` is governed only by workspace fit. Checkpointing and pagination tools are not subject to the size limit. For `read`, the harness accepts full file contents when they fit, including contents beyond Pi's usual 2,000-line/50 KB read limit. The built-in `bash` tool is replaced with a variant that returns the complete command output instead of only the last 2,000 lines / 50 KB, so long and noisy commands are accepted whole and then paginated against the live workspace; exit codes, timeouts, aborts and the temp file path in tool details are preserved. If a read will not fit, it is denied with a recommended line count; jump to an earlier checkpoint to free workspace, then retry with `offset`/`limit`. Plain-text tool outputs of at most 500 characters on a single line pass through unchanged, so small status messages are not held even when workspace is exhausted. Other oversized output is accepted as a first line-based chunk sized to fit both the available workspace and configured output limit. Continue with `output_receive_paginate`, or use `output_receive_full` after freeing workspace if the complete output will then fit. If no complete line fits, the output is denied with guidance to reduce the output or increase the available budget. Interception is informational and does not itself trigger a checkpoint interruption.
+The agent creates a checkpoint (a save point) before a large piece of work. It does the work, notes what it learned and what needs to happen next, then goes back to that save point. The messages in between are removed from the active conversation, but the agent carries its notes forward and continues from there.
+
+It doesn't need to keep every message. It needs to remember the things that matter for the next steps.
+
+### 2. Handle large files and command results
+
+A file or command can produce far more text than the agent can comfortably read at once. VC keeps the full result available during the session and lets the agent read it in smaller parts, when needed. This means the agent can work through very large inputs without filling its conversation with all of them at once.
+
+For example a bash command, that can't be run again safely, returns 5MB of data. With VC the agent can safely read all of it, even if the file is 4x larger than the context window. This is done by employing the accumulation checkpoint strategy - the extension automatically offers pagination of large outputs, agent can read in smaller chunks and jump back to the accumulation checkpoint with distilled information. This is repeated over and over until the output is exhausted. After the last jump the real context cost of reading the entire output may be just a single-digit percentage of context.
+
+I used a benchmark to test processing of large outputs in comparison to regular compaction:
+
+See the [RC vs. VC benchmark](./rc-vc-bench.md) for a comparison on a large-book research task. The results are specific to the tested model and task; results may differ with other models and workloads.
+
+### 3. Work closer to the context limit
+
+VC is designed to use more of the available context instead of keeping a large part of it free for regular compaction.
+
+The default settings are:
+
+| Setting | Default |
+| --- | ---: |
+| Soft limit — a good time to make a checkpoint jump | 75% |
+| Hard limit — the agent must make a jump | 85% |
+| Reasoning buffer | 2.5% |
+| Large tool output limit before it is force paginated | 8,000 estimated tokens |
+| Minimum distance between checkpoint jumps | 7.5% |
+| Emergency write margin | 3,000 tokens |
+
+**Soft limit** is only advisory, agent is informed it should wrap up any ongoing task and jump.
+**Hard limit** interrupts the agent unless it is actively writing, editing or jumping, but gives it a chance to reason before the jump.
+The **emergency zone** is the minimum amount of tokens required for a safe jump, any reasoning or write/edit is interrupted and the agent is forced to jump without reasoning.
+
+A successful jump has been observed at **94% use** of 72k context.
+In contrast regular compaction can sometimes fail (or worse - silently truncate) even at just 80% utilization.
+
+### 4. Multi-day workload stability on small models
+
+Long-horizon tasks are extected to be 20-60% faster with VC.
+Context rot is not an issue, agent can forget wrong assumptions autonomously.
+Intelligence over long horizons improves; on every jump the agent gets fresh eyes on the problem, like partial handoffs without a complete amnesia.
+
+Example: a long-running reverse-engineering session on Qwen.
+
+![Long-running reverse-engineering session showing token usage and context utilization](https://github.com/user-attachments/assets/ebeb4982-a8ea-4038-a79f-918742010c32)
 
 
-## Agent tools
+## Tools the agent can use
 
-### Checkpointing
-
-- `checkpoint_create` — create a checkpoint with arbitrary name and receive its numeric ID.
-- `checkpoint_list` — list eligible checkpoint IDs, names, recorded workspace usage, and utilization delta. For targets above the soft threshold, checkpoints that do not meet the configured minimum jump distance are omitted. Workspace usage is context tokens divided by the ingestible workspace capacity (hard threshold minus the workspace reasoning buffer), capped at 100%.
-
-For emergencies, invisible checkpoint 0 marks the initial user query.
-
-- `checkpoint_jump` — jump to a checkpoint with a payload and continue. Set `task_completed: true` to stop and wait for user input. In interactive TUI mode this leaves a decision line above the editor; **Alt+C** toggles whether the jump is applied when the next message arrives. In pi-web sessions, use `/jump` or `/nojump` before the next real message to choose the pending decision; omitting either command keeps the configured default.
-
-
-### Tool output
-
-Large tool outputs receive numerical IDs and are session-bound.
-- `output_receive_full` - retrieves the complete output by `id` when it fits in available workspace, for example after a checkpoint jump
-- `output_receive_paginate` - retrieves a later page by `id` using a 1-based line `offset` and optional maximum line `limit`; use successive offsets and `checkpoint_jump` to process large outputs incrementally.
-
-Agents can freely create a checkpoint between a tool call and output_receive, but buffered output data is lost when session exits - output processing can't be resumed in-flight.
-
+- `checkpoint_create` — save a point to return to.
+- `checkpoint_list` — see the available save points.
+- `checkpoint_jump` — go back to a save point and continue with a handover.
+- `output_receive_full` — read a saved result in full, when it fits.
+- `output_receive_paginate` — read part of a saved result.
 
 ## Configuration
 
-You can configure pretty much everything important:
-- soft/hard context utilization limits
-- workspace reasoning buffer for automatic read/output retrieval sizing (default 5%, range 0-25%)
-- maximum estimated size for non-read tool output before pagination (default 8,000 tokens)
-- minimum workspace-utilization difference required for a checkpoint jump (default 7.5%)
-- emergency write margin — raw retrieval workspace at which an open `write`/`edit` batch stops being deferred (default 3,000 tokens, range 0-32,768)
-- soft/hard limit messages that steer the agent
-- built-in injected system prompt that teaches agent voluntary compaction
-- default jump allow/deny after task completion
-- outright disable any context injection
-
-All settings can be set globally or for project or session in TUI.
-
-The defaults are currently fine-tuned for `Qwen 3.8` family of models and `GPT Luna`. Should work out of the box for better models. Might need some fine-tuning for weaker models. 
-
-My current favorite is `swift-1.5-qwen3.8-27b-gsq-rco @ IQ3-S; 72k context, K:Q8, V:IQ4_NL, MTP 0-2 @ 0.33`, running AMD 9070XT with 16GB VRAM, 700-900tps prefill, 45-65tps gen. 
-
-
-## Interoperability
-
-The extension supports `pi-subagents` extension and `pi-web.dev` GUI.
+You can change the limits, output size, safety margins and agent instructions globally, per project or per session in the Pi TUI. The defaults are tuned around Qwen 3.8-family models and GPT Luna; other models may need different settings.
 
 ## Installation
-
-Install with:
 
 ```sh
 pi install npm:pi-voluntary-compaction
 ```
+
+VC also supports `pi-subagents` and the `pi-web.dev` GUI.
+
+## Feedback
+
+If you find a weird behavior, feel free to drop me an issue on github.
+Any interesting behavior you come across - let me know too; this is as much an ongoing research effort as it is an extension.
+Just love the extension? Star the repo and spread the word!
 
