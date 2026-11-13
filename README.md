@@ -30,9 +30,9 @@ For those of you that care about real work results, here is another summary of a
 [Chat GPT Assesment of the restoration of Hell-Copter game](./case-studies/rea-hellcopter/rea-hellcopter-session-log-analysis.md)
 
 
-
+---
 > **Before using VC:** turn off Pi's automatic compaction. VC manages the conversation instead. No compaction should ever run.
-
+---
 
 ## How it works
 
