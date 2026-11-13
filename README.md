@@ -39,6 +39,12 @@ I used a benchmark to test processing of large outputs in comparison to regular 
 
 See the [RC vs. VC benchmark](./rc-vc-bench.md) for a comparison on a large-book research task. The results are specific to the tested model and task; results may differ with other models and workloads.
 
+Since the benchmark works with copyrighted material, I am not able to include it in the repo.
+
+I gave given the complete benchmark to GPT for objective critique and assesment: 
+
+[Chat GPT Assesment of the custom benchmark](./bench-gpt-assesment.md)
+
 ### 3. Work closer to the context limit
 
 VC is designed to use more of the available context instead of keeping a large part of it free for regular compaction.
