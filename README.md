@@ -17,6 +17,19 @@ VC does not erase the conversation completely, only the parts the agent deems no
 
 Plus it's fully transparent and automatic (no meat proxy), the agent decides what and when is important.
 
+## Benchmarks and case-studies
+
+I used a custom benchmark to test processing of large outputs in comparison to regular compaction, the benchmark assignment and results are available in the repo but the source material used is copyrighted.
+I have given the complete benchmark to GPT for objective critique and assesment: 
+
+[Chat GPT Assesment of the custom benchmark and results](./case-studies/book-bench/bench-gpt-assesment.md)
+
+
+For those of you that care about real work results, here is another summary of a 96.5MB session log from my REA game restoration of a classic game Hell-Copter, done on Qwen 3.8 Flash Next Q3_S finetune with only 72k context, most of the work was done over two nights. Game was inoperable for 25 years and had significant 3D issues even after it was first successfully launched. It is now functional, perfectly playable with upscaled textures.
+
+[Chat GPT Assesment of the restoration of Hell-Copter game](./case-studies/rea-hellcopter/rea-hellcopter-session-log-analysis.md)
+
+
 
 > **Before using VC:** turn off Pi's automatic compaction. VC manages the conversation instead. No compaction should ever run.
 
@@ -35,15 +48,6 @@ A file or command can produce far more text than the agent can comfortably read 
 
 For example a bash command, that can't be run again safely, returns 5MB of data. With VC the agent can safely read all of it, even if the file is 4x larger than the context window. This is done by employing the accumulation checkpoint strategy - the extension automatically offers pagination of large outputs, agent can read in smaller chunks and jump back to the accumulation checkpoint with distilled information. This is repeated over and over until the output is exhausted. After the last jump the real context cost of reading the entire output may be just a single-digit percentage of context.
 
-I used a benchmark to test processing of large outputs in comparison to regular compaction:
-
-See the [RC vs. VC benchmark](./rc-vc-bench.md) for a comparison on a large-book research task. The results are specific to the tested model and task; results may differ with other models and workloads.
-
-Since the benchmark works with copyrighted material, I am not able to include it in the repo.
-
-I gave given the complete benchmark to GPT for objective critique and assesment: 
-
-[Chat GPT Assesment of the custom benchmark](./bench-gpt-assesment.md)
 
 ### 3. Work closer to the context limit
 

@@ -1,0 +1,21 @@
+{
+  "protocol_version": "adaptive-session-trace-v4",
+  "book_file": "book.txt",
+  "output_dir": "output",
+  "rules": {
+    "no_read_bench": "Do not open, read, grep, list, or otherwise inspect anything under ./bench/; it contains evaluator-only ground truth and scoring code.",
+    "read_full_book": "Read book.txt completely from beginning to end before answering. The agent may choose any retrieval, read-range, summarization, or context-management strategy; no fixed read granularity is required. Read and search the original book.txt directly.",
+    "no_temporary_files": "Do not create temporary, scratch, or intermediate files anywhere, including the run directory, output/, /tmp, hidden directories, or system temp locations. Do not copy, split, extract, convert, compress, cache, or materialize book.txt or any part of it into another file, including chapter/section files or extracted-passage files. The only files the agent may create are the four required answer JSON files.",
+    "answer_from_source": "Use book.txt as the sole source of truth for answers. The agent may revisit or search the book as needed; retrieval strategy is not independently penalized.",
+    "output_only": "Do not modify book.txt, input/, or bench/. Write only the four required task answer files inside output/; keep any summaries in working context rather than writing intermediate files.",
+    "no_agent_telemetry": "Do not require agent-authored run or progress logs. Session/tool traces are the evaluator's source for observable run measurements.",
+    "no_fabrication": "Never invent facts. When a premise is unsupported by the book, say so in the answer string."
+  },
+  "scoring_weights": {
+    "single_needles": 0.31,
+    "multihop": 0.15,
+    "structured_chapters": 0.10,
+    "structured_characters": 0.10,
+    "retention_early": 0.10
+  }
+}

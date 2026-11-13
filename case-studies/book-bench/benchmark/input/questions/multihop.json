@@ -1,0 +1,14 @@
+{
+  "task": "multihop",
+  "instructions": "Each question requires combining facts from more than one chapter of book.txt. Answer using only the book. Output a JSON object mapping id to answer string.",
+  "questions": [
+    {"id": "mh01", "question": "In chapter 6, Ragnar is assigned to a five-member hunting squad. Name all four other members, and state which one is killed by a troll in chapter 7."},
+    {"id": "mh02", "question": "Ranek first saves Ragnar's crew in chapter 1 and later mentors him. In chapter 10, what does Ranek say about the founding and origins of the Space Wolves (Hvězdní vlci)?"},
+    {"id": "mh03", "question": "In chapter 6, Ragnar is grouped with the rival Strybjorn. After Strybjorn saves his life in chapter 17 and is carried to the field medics, what exact words does Ragnar say to the medic about Strybjorn? Quote the Czech."},
+    {"id": "mh04", "question": "Ragnar travels to a world in chapter 5, then passes through a named gate in chapter 9. Name both the world and the gate."},
+    {"id": "mh05", "question": "In the prologue and chapters 1 and 2, name three people identified as Ragnar's brothers. Use only people identified as his brothers in those sections, not other crew members."},
+    {"id": "mh06", "question": "The pistol Ragnar receives in chapter 13 is described as similar to a weapon used earlier by the wizard. Who used it and against what?"},
+    {"id": "mh07", "question": "In chapter 13 the knowledge-crown reveals the four great powers of Chaos. Name all four."},
+    {"id": "mh08", "question": "The squad's leader in chapters 13-17 is a sergeant. Name him and state what he orders at the end of chapter 16."}
+  ]
+}

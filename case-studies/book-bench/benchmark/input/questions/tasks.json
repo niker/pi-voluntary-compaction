@@ -1,0 +1,16 @@
+{
+  "task": "structured_extraction",
+  "instructions": "Produce two structured artifacts from book.txt. Write them as separate files in output/.",
+  "outputs": [
+    {
+      "file": "output/chapters.json",
+      "schema": {"chapters": [{"num": "int (0=prolog,1..17,epilog=18)", "czech": "string", "title": "string", "start": "int line", "end": "int line"}]},
+      "instructions": "List EVERY chapter: prologue + 17 numbered chapters + epilogue (19 total). Give the Czech numeral, title line, and start/end line numbers in book.txt. The end is the line number of the final line containing chapter text, not a blank separator. The epilogue ends before the 'O AUTOROVI' section; 'O AUTOROVI' is not a chapter."
+    },
+    {
+      "file": "output/characters.json",
+      "schema": {"characters": [{"name": "string", "first_line": "int", "role": "string (<=6 words)"}]},
+      "instructions": "List every distinct named individual person who appears in the story, including legendary or historical people and people described as gods or deified (for example the Emperor and Leman Russ / Russ). Do not list places, groups, species, objects, or other non-person entities. Exclude names appearing only in the 'O AUTOROVI' matter after the epilogue. Give the first line where each person's name appears in the story and a short role. Be exhaustive."
+    }
+  ]
+}

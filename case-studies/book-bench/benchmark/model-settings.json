@@ -1,0 +1,74 @@
+{
+  "modelName": "Swift 1.5 Qwen3.8 27B GSQ RCO Mtp",
+  "indexedModelIdentifier": "taurusduan/Swift-1.5-Qwen3.8-27B-GSQ-RCO-GGUF/Swift-1.5-Qwen3.8-27B-GSQ-RCO-IQ3_S-mtp.gguf",
+  "displayName": "Swift 1.5 Qwen3.8 27B GSQ RCO Mtp",
+  "containingDirSubpath": "taurusduan/Swift-1.5-Qwen3.8-27B-GSQ-RCO-GGUF",
+  "containingDirMtime": 1790713213736,
+  "containingDirAbsolutePath": "/run/media/niker/v/AI/LMStudioModels/taurusduan/Swift-1.5-Qwen3.8-27B-GSQ-RCO-GGUF",
+  "sourceDirectoryType": "user",
+  "format": "gguf",
+  "metadata": {
+    "gguf": {
+      "arch": "qwen35",
+      "name": "Swift15-GSQ-V1MIX-ISTAalloc-IQ3_S MTP"
+    }
+  },
+  "runtime": {
+    "application": "LM Studio",
+    "operatingSystem": "Kubuntu 26.04",
+    "gpu": {
+      "model": "AMD Radeon 9070 XT",
+      "vramGB": 16
+    }
+  },
+  "inferenceSettings": {
+    "contextLengthTokens": 72192,
+    "modelMaximumContextLengthTokens": 262144,
+    "gpuOffloadLayers": 65,
+    "cpuThreadPoolSize": 8,
+    "evaluationBatchSize": 512,
+    "physicalBatchSize": 128,
+    "maxConcurrentPredictions": 2,
+    "unifiedKvCache": true,
+    "contextCheckpoints": 16,
+    "reasoningBudgetMessage": {
+      "visiblePrefix": "Enough thinking, immediately call `checkpoint_return` and hand off only re",
+      "completeText": null,
+      "note": "Text is clipped by the screenshot field; the full message is not visible."
+    },
+    "ropeFrequencyBase": "auto",
+    "ropeFrequencyScale": "auto",
+    "offloadKvCacheToGpuMemory": true,
+    "keepModelInMemory": true,
+    "tryMmap": false,
+    "seed": {
+      "enabled": false,
+      "value": "random"
+    },
+    "speculativeDecoding": {
+      "method": "MTP",
+      "maxDraftTokens": 2,
+      "minDraftTokens": 0,
+      "draftProbability": 0.33
+    },
+    "flashAttention": true,
+    "kvCacheQuantization": {
+      "k": {
+        "enabled": true,
+        "type": "Q8_0"
+      },
+      "v": {
+        "enabled": true,
+        "type": "IQ4_NL"
+      }
+    },
+    "chatTemplate": {
+      "visible": false,
+      "value": null,
+      "note": "Section is collapsed in the screenshot; value is unknown."
+    }
+  },
+  "source": {
+    "configuration": "User-provided model metadata and LM Studio settings screenshot"
+  }
+}
