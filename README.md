@@ -66,9 +66,12 @@ In contrast regular compaction can sometimes fail (or worse - silently truncate)
 
 ### 4. Multi-day workload stability on small models
 
-Long-horizon tasks are extected to be 20-60% faster with VC.
+Long-horizon tasks are expected to be 20-60% faster with VC.
+
 Context rot is not an issue, agent can forget wrong assumptions autonomously.
+
 Intelligence over long horizons improves; on every jump the agent gets fresh eyes on the problem, like partial handoffs without a complete amnesia.
+
 
 Example: a long-running reverse-engineering session on Qwen.
 
