@@ -101,6 +101,8 @@ VC also supports `pi-subagents` and the `pi-web.dev` GUI.
 ## Feedback
 
 If you find a weird behavior, feel free to drop me an issue on github.
+
 Any interesting behavior you come across - let me know too; this is as much an ongoing research effort as it is an extension.
+
 Just love the extension? Star the repo and spread the word!
 
