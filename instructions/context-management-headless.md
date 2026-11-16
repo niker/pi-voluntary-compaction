@@ -3,7 +3,7 @@
 This environment does not use context compaction but a combination of agent-managed checkpoints and large output interception.
 Default rules for managing your context are now replaced; context was replaced by a high-level abstraction in this environment - the Workspace. 
 
-Tools you use will dynamically guide you to properly manage your workspace - diligently follow notices in sqare brackets at the last line of tool output.
+Tools you use will dynamically guide you to properly manage your workspace - diligently follow notices in square brackets at the last line of tool output.
 
 ### Concepts
 
@@ -56,6 +56,8 @@ Example timeline of processing:
 4) Read the next chunk and process it.
 5) Jump back to suitable accumulation checkpoint again and repeat until all is processed.
 
+Never queue multiple file reads in single turn.
+
 ### After completing a task
 
 - Report completion to the parent agent in public text (outside reasoning).
@@ -65,7 +67,7 @@ Example timeline of processing:
 
 ### Examples of payload content
 
-Should capture all relevant information since the target checkpoint:
+Jump payloads must capture all relevant information since the target checkpoint:
 
 - Tasks completed
 - Tasks pending
@@ -73,18 +75,20 @@ Should capture all relevant information since the target checkpoint:
 - Non-obvious facts learned
 - Paths of all progress-tracking files written
 - Files changed
-- Plan of next actions
 - Final drafts of code
+- Plan of next actions
 
+Always include the next action.
  
 ### After receiving a payload
 
 When a jump payload is received:
 
+- Payload content overrides all chat history that happened before it was received.
 - Trust the payload implicitly.
-- Treat the facts and decisions in it as settled.
-- Do not reconstruct, repeat, or verify information it contains.
-- Continue with its stated next action.
+- Do not reconstruct, repeat, or verify stated facts.
+- Treat all decisions as settled.
+- You must continue with the next action stated in the payload.
 
 When the received payload is large and contained information is all relevant, you can lock-in the knowledge permanently by creating a new secondary accumulation checkpoint; that way the next jump can omit this locked-in knowledge.
 
@@ -96,7 +100,8 @@ When the received payload is large and contained information is all relevant, yo
 - Lock-in the knowledge in just-received jump payload permanently by creating a new checkpoint.
 - The only way to free workspace is to jump back to an earlier checkpoint that had cleaner workspace.
 - Do not be conservative when sizing file `read` chunks regardless of workspace use, use a generous amount of lines when chunking (150-300); trust the guidance notices provided after using tools.
-- Your jumps should target suitable checkpoints below 40% utilization, but try to select checkpoints with most locked-in payloads.
+- Your jumps should target suitable checkpoints below 40% total utilization.
+- Jump targets must balance jumping to low utilization while keeping previous locked-in payloads.
 - Creating a checkpoint after a large read without jumping first makes no sense.
 - Always prefer to use MCP tools in code mode if available, especially when searching or listing tools.
 

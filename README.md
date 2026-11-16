@@ -87,6 +87,20 @@ Example: a long-running reverse-engineering session on Qwen.
 
 ![Long-running reverse-engineering session showing token usage and context utilization](https://github.com/user-attachments/assets/ebeb4982-a8ea-4038-a79f-918742010c32)
 
+### 5. Switch from cloud to local model mid-task
+
+You can do a transparent handoff from a model with 1mill context window to one that uses just 128k or less.
+
+No matter how much context the original model used.
+
+1. Order the agent to jump to a low utilization checkpoint (manually or `/vc checkpoints`)
+2. When the jump tool flashes green as completed - hit `ESC` to interrupt the agent before more generation
+3. Switch to a model with smaller context window
+4. Type `/vc continue`
+5. New model takes over and proceeds with the original task as if it was working on it all along.
+
+This will be rolled into an integrated feature eventually, manual for now.
+
 
 ## Tools the agent can use
 
@@ -99,6 +113,13 @@ Example: a long-running reverse-engineering session on Qwen.
 ## Configuration
 
 You can change the limits, output size, safety margins and agent instructions globally, per project or per session in the Pi TUI. The defaults are tuned around Qwen 3.8-family models and GPT Luna; other models may need different settings.
+
+## Commands the user can run
+
+- `/vc` — open the settings; `/vc settings` is the same command.
+- `/vc checkpoints` — browse the checkpoints that are currently available to the agent; selecting a checkpoint can order the agent to jump there via automatic steer.
+- `/vc outputs` — browse captured tool outputs that are currently available in the session.
+- `/vc continue` — returns the turn back to the agent without appending any message. Useful after a /tree jump to avoid changing behavior.
 
 ## Installation
 

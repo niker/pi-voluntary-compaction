@@ -37,6 +37,20 @@ export type Config = {
    * from the hard percent. Default 3000. Range: 0-32768.
    */
   emergencyWriteMargin: number;
+  /**
+   * Number of checkpoints beyond which the agent is encouraged to clean up;
+   * relevant for multi-day tasks, combines locked-in payloads into one and
+   * eliminates repetition in accumulated context. `checkpoint_list` appends a
+   * distill-and-jump advisory once the list is longer than this while workspace
+   * is still below the hard threshold. Default 10. Range: 1-1000.
+   */
+  crowdedCheckpointsLimit: number;
+  /**
+   * Pre-tool training experiment. Re-trains the agent how to use tools correctly
+   * after each jump by injecting one completed example tool call into the first
+   * post-jump request, which raises reliability for heavily quantized models.
+   */
+  toolUseTraining: boolean;
 };
 
 export const DEFAULT_CONFIG: Config = {
@@ -61,7 +75,9 @@ export const DEFAULT_CONFIG: Config = {
   advertiseVoluntaryCompaction: true,
   afterTaskCompaction: "allowed",
   outputMarginFloorTokens: 256,
-  emergencyWriteMargin: 3000,
+  emergencyWriteMargin: 4000,
+  crowdedCheckpointsLimit: 10,
+  toolUseTraining: true,
 };
 
 export const config: Config = { ...DEFAULT_CONFIG };

@@ -20,7 +20,19 @@ import { createUnlimitedBashToolDefinition } from "./unlimited-bash.js";
 
 type PendingJump = { target: string; checkpointId: number; payload: string; taskCompleted: boolean; subagent: boolean; autoResume: boolean };
 type PendingJumpOffer = { target: string; checkpointId: number; payload: string; allowed: boolean };
-type BufferedToolOutput = { kind: "memory"; content: any[]; details: unknown; estimatedTokens: number; lineCount: number };
+type BufferedToolOutput = {
+  kind: "memory";
+  content: any[];
+  details: unknown;
+  estimatedTokens: number;
+  lineCount: number;
+  toolName: string;
+  label: string;
+  // Tool call whose result carried the first page, and the tool call whose result
+  // carried the post-jump size advisory. Both are branch membership probes, not IDs.
+  carrierToolCallId: string;
+  sizeNoticeToolCallId?: string;
+};
 type ClippedRead = { offset: number; requestedLines?: number; actualLines: number };
 const EXTENSION_TYPE = "pi-voluntary-compaction";
 const CONFIG_ENTRY_TYPE = "pi-voluntary-compaction-config";
@@ -51,8 +63,12 @@ const EMERGENCY_WRITE_ADVISORY = "[The issued write was completed. Workspace uti
 // Injected instead when the mutation never ran at all: a streamed write/edit whose
 // growing arguments projected the prompt into the emergency zone is aborted before
 // its tool call can execute, so no file changed and the composed content is gone.
-// The model must not re-emit that content — it must spend what is left on the jump.
-const EMERGENCY_STREAM_ABORT_ADVISORY = "[The streamed write/edit was interrupted BEFORE it ran: nothing was written to disk and the content you were composing is discarded. Do not rewrite that file. Emit checkpoint_jump now, with no prose and no reasoning, using one of the listed checkpoint IDs.]";
+// Deliberately terse and alarming: the agent must read this as "the world is burning,
+// there is no room for anything, jump now" rather than weigh options. Silence needs no
+// instruction - the abort already forces thinking off and the injected header supplies a
+// one-line <think> block - and the checkpoint list follows this advisory, so the jump
+// target never has to be named here.
+const EMERGENCY_STREAM_ABORT_ADVISORY = "[The workspace utilization is critical and will not allow your write to complete, your changes were discarded! You must jump to an earlier checkpoint now!]";
 
 const isFileMutatingToolName = (toolName: unknown): boolean =>
   FILE_MUTATING_TOOL_NAMES.includes(toolName as (typeof FILE_MUTATING_TOOL_NAMES)[number]);
@@ -240,6 +256,55 @@ function textLines(text: string): string[] {
   return lines;
 }
 
+// A captured output is identified to the user by one short line: the tool call that
+// produced it when the call carries a readable argument (a bash command, a read
+// path), otherwise the beginning of the output itself.
+const OUTPUT_LABEL_CHARACTERS = 32;
+const OUTPUT_ROW_CHARACTERS = 96;
+
+function inlineText(value: string): string {
+  return value.replace(/\s+/g, " ").trim();
+}
+
+function singleLineExcerpt(value: string, limit = OUTPUT_LABEL_CHARACTERS): string {
+  const collapsed = inlineText(value);
+  if (!collapsed) return "";
+  const characters = Array.from(collapsed);
+  return characters.length > limit ? `${characters.slice(0, limit).join("")}…` : collapsed;
+}
+
+function toolInvocationLabel(toolName: string, input: unknown): string {
+  if (!input || typeof input !== "object" || Array.isArray(input)) return "";
+  const record = input as Record<string, unknown>;
+  // Prefer the argument that names the work: a shell command, a file, a pattern.
+  const preferred = toolName === "read" ? ["path", "file_path"] : ["command", "cmd", "path", "file_path", "pattern", "query", "url", "prompt"];
+  for (const key of preferred) {
+    const value = record[key];
+    if (typeof value === "string") {
+      const excerpt = singleLineExcerpt(value);
+      if (excerpt) return excerpt;
+    }
+  }
+  for (const value of Object.values(record)) {
+    if (typeof value !== "string") continue;
+    const excerpt = singleLineExcerpt(value);
+    if (excerpt) return excerpt;
+  }
+  return "";
+}
+
+function outputLabel(toolName: string, input: unknown, content: readonly any[]): string {
+  return toolInvocationLabel(toolName, input)
+    || singleLineExcerpt(contentText(content))
+    || "(non-text output)";
+}
+
+// One selectable row per captured output or checkpoint: never wraps, never scrolls.
+function fitOneLine(value: string, limit = OUTPUT_ROW_CHARACTERS): string {
+  const characters = Array.from(value.replace(/\s+/g, " ").trim());
+  return characters.length > limit ? `${characters.slice(0, Math.max(1, limit - 1)).join("")}…` : characters.join("");
+}
+
 function countLinesWithinTokenBudget(text: string, offset: number, tokenBudget: number): number {
   if (tokenBudget <= 0) return 0;
   const lines = textLines(text);
@@ -275,13 +340,69 @@ function formatOutputPage(
   pageLines: number,
   totalLines: number,
   pageNotice?: string,
+  restateSize?: boolean,
+  requestedEnd?: number,
 ): string {
   const nextOffset = offset + pageLines;
-  const continuation = nextOffset > totalLines
-    ? "This was the last page."
+  // A page can meet the tail in three different ways, and each leaves the agent with a
+  // different doubt. Starting beyond the last line delivers nothing at all, so the size is
+  // the only useful fact to return. An over-run that still starts inside the output hands
+  // over real lines; it reads as an ordinary last page and adds the size, because overshoot
+  // is usually a miscount rather than a fault and an alarming notice invites diagnostic reads
+  // that cost more than the one line they save. A page landing exactly on the last line
+  // leaves no doubt about the boundary, so naming the size there repeats what shows.
+  if (offset > totalLines) {
+    return appendBottomNotice(pageText, `[Your read was out of bounds, total output size is ${totalLines} lines.]`);
+  }
+  const endsAtTail = nextOffset > totalLines;
+  // An omitted limit is sized to the lines that remain, so only an explicit limit can ask
+  // for lines past the end.
+  const clippedPastTail = requestedEnd !== undefined && requestedEnd > totalLines;
+  const continuation = endsAtTail
+    ? "The last page was exhausted."
     : `To continue, call 'output_receive_paginate' with id ${id}, offset ${nextOffset} and a suitable limit.`;
-  const notice = pageNotice ? `[${pageNotice}. ${continuation}]` : `[${continuation}]`;
-  return appendBottomNotice(pageText, notice);
+  // `pageNotice` frames the page being handed out, so it leads; the size trails behind the
+  // instruction the agent has to act on. Tense carries a fact of its own: the count `was`
+  // once the output is fully read, and `is` while lines remain. A jump that wiped the page
+  // carrying the size asks for the restatement (`restateSize`).
+  const sentences: string[] = [];
+  if (pageNotice) sentences.push(`${pageNotice}.`);
+  sentences.push(continuation);
+  if (endsAtTail && clippedPastTail) {
+    // The over-run already ends the output, so its size sentence is past tense and no
+    // separate restatement follows it.
+    sentences.push(`Total output size was ${totalLines} lines.`);
+  } else if (restateSize) {
+    sentences.push(`Total output size ${endsAtTail ? "was" : "is"} ${totalLines} lines.`);
+  }
+  return appendBottomNotice(pageText, `[${sentences.join(" ")}]`);
+}
+
+// The page handed out at capture time names the total size ("showing lines 1-N of
+// TOTAL"). A jump that rewinds past the captured tool result wipes that page, and an
+// agent which only kept the output ID in its payload then has no end boundary: it
+// paginates past the tail and triangulates where the output stopped. Re-state the
+// size on the first page delivered after such a wipe; every later page on the same
+// branch already has that sentence in context, so this stays a one-line-per-jump cost.
+function toolResultOnBranch(sm: SessionManager, toolCallId: string): boolean {
+  return sm.getBranch().some((entry: any) => entry.type === "message"
+    && entry.message?.role === "toolResult"
+    && entry.message.toolCallId === toolCallId);
+}
+
+function shouldRestateOutputSize(sm: SessionManager, output: BufferedToolOutput): boolean {
+  if (toolResultOnBranch(sm, output.carrierToolCallId)) return false;
+  const advised = output.sizeNoticeToolCallId;
+  // The agent has already been told the size on this branch when that result is still
+  // reachable; only a jump can put it off-branch again.
+  if (advised !== undefined && toolResultOnBranch(sm, advised)) return false;
+  return true;
+}
+
+function markOutputSizeNoticeDelivered(output: BufferedToolOutput, toolCallId: string): void {
+  // The page becomes the tool result of this very call, so a later paginate on the same
+  // branch finds it and stays quiet; only another jump can hide it again.
+  output.sizeNoticeToolCallId = toolCallId;
 }
 
 function outputPageWithinBudget(
@@ -770,11 +891,38 @@ function roundedPercent(value: number): string {
 }
 
 function formatCheckpointLabel(checkpoint: CheckpointLabel, workspaceDelta?: number): string {
+  return `[${checkpoint.id}]: ${checkpoint.name}${checkpointMeasurementSuffix(checkpoint, workspaceDelta)}`;
+}
+
+// The measurement suffix is what makes a checkpoint actionable, so it is composed
+// apart from the name; row fitting gives up name characters instead of clipping it.
+const CHECKPOINT_ROW_CHARACTERS = 96;
+// An ordered jump lists the checkpoints it will discard, so each name stays short
+// enough for the steer to remain a distillation checklist rather than a transcript.
+const CHECKPOINT_NAME_CHARACTERS = 160;
+
+function checkpointMeasurementSuffix(checkpoint: CheckpointLabel, workspaceDelta?: number): string {
   const percentage = checkpoint.workspaceUsedPercent;
-  if (percentage === undefined) return `[${checkpoint.id}]: ${checkpoint.name}`;
-  const formatted = roundedPercent(percentage);
+  if (percentage === undefined) return "";
   const delta = workspaceDelta === undefined ? "" : `, Δ ${roundedPercent(workspaceDelta)}%`;
-  return `[${checkpoint.id}]: ${checkpoint.name} (utilization: ${formatted}%${delta})`;
+  return ` (utilization: ${roundedPercent(percentage)}%${delta})`;
+}
+
+function formatCheckpointRow(
+  checkpoint: CheckpointLabel,
+  workspaceDelta?: number,
+  limit = CHECKPOINT_ROW_CHARACTERS,
+): string {
+  const prefix = `[${checkpoint.id}]: `;
+  const suffix = checkpointMeasurementSuffix(checkpoint, workspaceDelta);
+  const name = inlineText(checkpoint.name);
+  const characters = Array.from(name);
+  const budget = limit - Array.from(`${prefix}${suffix}`).length;
+  if (budget <= 0) return `${prefix}${name}${suffix}`;
+  const fitted = characters.length > budget
+    ? `${characters.slice(0, Math.max(1, budget - 1)).join("")}…`
+    : name;
+  return `${prefix}${fitted}${suffix}`;
 }
 
 type ForcedThinkingHint = { thinkingLevel: string };
@@ -863,9 +1011,7 @@ function checkpointEntries(sm: SessionManager): StoredCheckpoint[] {
 
 function checkpointJumpNotice(sm: SessionManager, id: number): string {
   const checkpoint = checkpointEntries(sm).find((entry) => entry.checkpoint.id === id)?.checkpoint;
-  const notice = id === 0
-    ? "Jumped to checkpoint, continue from the payload"
-    : `Jumped to checkpoint [${id}], continue from the payload`;
+  const notice = "Jump completed and the payload is active.";
   const percentage = checkpoint?.workspaceUsedPercent;
   if (percentage === undefined) return `[${notice}.]`;
   const formatted = roundedPercent(percentage);
@@ -876,7 +1022,7 @@ function checkpointJumpNotice(sm: SessionManager, id: number): string {
   // The string is past tense regardless: it is only ever read after the jump
   // lands, once the agent has lost the pre-jump turn, and a task_completed jump
   // is committed by the next action unless the human specifically opts out.
-  return `[${notice}; workspace has been cleared to ${generosity}${formatted}% utilization.]`;
+  return `[${notice} Workspace has been cleared to ${generosity}${formatted}% utilization.]`;
 }
 
 function nextCheckpointId(sm: SessionManager): number {
@@ -1011,6 +1157,7 @@ const CONFIG_KEYS: (keyof Config)[] = [
   "softThresholdPercent", "hardThresholdPercent", "workspaceReasoningBufferPercent", "maxToolOutputTokens", "minimumJumpDistance", "softMessage",
   "hardReasoningMessage", "hardNonReasoningMessage", "instructions",
   "advertiseVoluntaryCompaction", "afterTaskCompaction", "outputMarginFloorTokens", "emergencyWriteMargin",
+  "crowdedCheckpointsLimit", "toolUseTraining",
 ];
 type ConfigOverrides = Partial<Config>;
 
@@ -1038,10 +1185,16 @@ function validConfig(value: any): value is Config {
     && (value.outputMarginFloorTokens === null
       || (Number.isSafeInteger(value.outputMarginFloorTokens)
         && value.outputMarginFloorTokens >= 256
-        && value.outputMarginFloorTokens <= 8192)
+        && value.outputMarginFloorTokens <= 8192))
     && Number.isSafeInteger(value.emergencyWriteMargin)
     && value.emergencyWriteMargin >= 0
-    && value.emergencyWriteMargin <= 32768);
+    && value.emergencyWriteMargin <= 32768
+    && Number.isSafeInteger(value.crowdedCheckpointsLimit)
+    && value.crowdedCheckpointsLimit >= 1
+    && value.crowdedCheckpointsLimit <= 1000
+    // A stored config predating this key keeps the default instead of losing every
+    // other override, so only a present value has to be boolean.
+    && (value.toolUseTraining === undefined || typeof value.toolUseTraining === "boolean");
 }
 
 function validOverrides(value: any): value is ConfigOverrides {
@@ -1053,6 +1206,7 @@ function validOverrides(value: any): value is ConfigOverrides {
     if (key === "workspaceReasoningBufferPercent") return typeof item === "number" && Number.isFinite(item) && item >= 0 && item <= 25;
     if (key === "maxToolOutputTokens") return typeof item === "number" && Number.isSafeInteger(item) && item >= 1;
     if (key === "advertiseVoluntaryCompaction") return typeof item === "boolean";
+    if (key === "toolUseTraining") return typeof item === "boolean";
     if (key === "afterTaskCompaction") return item === "denied" || item === "allowed";
     // Token counts are not percentages: validate before the generic 0-100 branch.
     if (key === "outputMarginFloorTokens") {
@@ -1061,6 +1215,10 @@ function validOverrides(value: any): value is ConfigOverrides {
     }
     if (key === "emergencyWriteMargin") {
       return typeof item === "number" && Number.isSafeInteger(item) && item >= 0 && item <= 32768;
+    }
+    // Checkpoint count, not a percentage: validate before the generic 0-100 branch.
+    if (key === "crowdedCheckpointsLimit") {
+      return typeof item === "number" && Number.isSafeInteger(item) && item >= 1 && item <= 1000;
     }
     if (key.endsWith("Message")) return typeof item === "string";
     return typeof item === "number" && Number.isFinite(item) && item >= 0 && item <= 100;
@@ -1143,7 +1301,73 @@ const SETTING_DESCRIPTIONS: Record<keyof Config, string> = {
   afterTaskCompaction: "Default decision shown after the agent requests task compaction. Alt+C toggles it in the TUI; pi-web provides /jump and /nojump commands before the next message applies it.",
   outputMarginFloorTokens: "Output tokens reserved for the forced-jump answer when workspace is exhausted at the hard threshold, replacing pi's fixed 4096-token margin. Default 256 keeps only a safety sliver because tool-output interception already bounds oversized results. Set to null (empty) to keep pi's behavior. Range: 256-8192.",
   emergencyWriteMargin: "Raw retrieval workspace (tokens still below the hard threshold) at which an open write/edit batch stops being deferred. The write already in flight is saved, then pressure fires immediately so the jump payload keeps room; the break happens at this margin plus the forced-jump output floor. Default 3000. Range: 0-32768.",
+  crowdedCheckpointsLimit: "Number of checkpoints beyond which the agent is encouraged to clean up; relevant for multi-day tasks, combines locked-in payloads into one and eliminates repetition in accumulated context. `checkpoint_list` adds a distill-and-jump advisory once more checkpoints are available than this while workspace is still below the hard threshold. Range: 1-1000.",
+  toolUseTraining: "Re-train the agent how to use tools correctly after each jump by registering `payload_receive` and injecting one completed example call into the first post-jump request. This increases reliability of heavily quantized models. Turning it off leaves the tool unregistered and unadvertised, which takes effect at the next session start.",
 };
+
+/** Advisory the agent reads after a jump; delivered as the injected example call's output. */
+const POST_JUMP_ADVISORY = "[Current active payload received. Continue with its next step.]";
+/** Advisory as it reached the model before the injected example existed (opt-out path). */
+const POST_JUMP_ADVISORY_LEGACY = "Current active payload received. Continue with its next step.";
+/**
+ * How a carried-forward payload must read to the agent. Pi renders a `branch_summary`
+ * with its own retrospective sentence — "The following is a summary of a branch that
+ * this conversation came back from:" — which presents the payload as closed history,
+ * so an older user request that the jump already answered keeps winning over the
+ * payload's stated next action. The session entry keeps pi's wording; only the
+ * outgoing request is relabelled, and the `<summary>` envelope is preserved.
+ */
+const ACTIVE_PAYLOAD_HEADER = "The following is an active jump payload:";
+/**
+ * Pi's branch-summary header as it reaches the model when the conversion already
+ * happened upstream of the context hook. Mirrors `BRANCH_SUMMARY_PREFIX` in
+ * `@earendil-works/pi-coding-agent/dist/core/messages.js`, which that package does
+ * not re-export; matched loosely so a reworded envelope still relabels.
+ */
+const PI_BRANCH_SUMMARY_HEADER = /^The following is a summary of a branch that this conversation came back from:\s*/;
+/** Envelope pi closes a rendered summary with. */
+const BRANCH_SUMMARY_ENVELOPE_SUFFIX = "</summary>";
+/**
+ * Relabels branch summaries as live payloads, returning the original array when no
+ * message matched so an untouched context keeps its cached prefix and skips rework.
+ */
+function labelBranchSummariesAsPayloads(messages: any[]): any[] {
+  let changed = false;
+  const relabelled = messages.map((message: any) => {
+    if (message?.role === "branchSummary") {
+      changed = true;
+      const summary = typeof message.summary === "string" ? message.summary : "";
+      return {
+        role: "user" as const,
+        content: [{ type: "text" as const, text: `${ACTIVE_PAYLOAD_HEADER}\n\n<summary>\n${summary}${BRANCH_SUMMARY_ENVELOPE_SUFFIX}` }],
+        timestamp: message.timestamp,
+      };
+    }
+    if (message?.role === "user" && Array.isArray(message.content)) {
+      const first = message.content[0];
+      if (first?.type === "text" && typeof first.text === "string" && PI_BRANCH_SUMMARY_HEADER.test(first.text)) {
+        changed = true;
+        return {
+          ...message,
+          content: [{ ...first, text: first.text.replace(PI_BRANCH_SUMMARY_HEADER, `${ACTIVE_PAYLOAD_HEADER}\n\n`) }],
+        };
+      }
+    }
+    return message;
+  });
+  return changed ? relabelled : messages;
+}
+/**
+ * Example tool for the post-jump pre-tool training. While `toolUseTraining` is on it
+ * is registered like any other tool and advertised in the tool list, so the injected
+ * example names a tool the agent could also run itself; running it always answers
+ * that the payload was already accepted, whatever arguments it is given. Turning the
+ * setting off leaves it unregistered and unadvertised, which takes effect at the next
+ * session start because that is where the stored setting is read.
+ */
+const PAYLOAD_RECEIVE_TOOL = "payload_receive";
+/** Answer once the payload has landed: the tool never carries it a second time. */
+const PAYLOAD_RECEIVE_RESULT = "[Payload was already accepted.]";
 
 export default function (pi: ExtensionAPI): void {
   const pendingToolOutputs = new Map<number, BufferedToolOutput>();
@@ -1155,6 +1379,16 @@ export default function (pi: ExtensionAPI): void {
   let hardInterruptionPending = false;
   let hardInterruptionCancelledForJump = false;
   let assistantBumpPending = false;
+  // Set when a completed jump has queued its resume turn and the example tool call
+  // still has to ride the first post-jump request. Consumed by the `context` hook.
+  let postJumpExamplePending = false;
+  // Checkpoint the jump landed on, so the example call can name it as its argument.
+  let postJumpExampleTargetId: number | null = null;
+  let payloadReceiveExampleSeq = 0;
+  // Whether payload_receive is registered for this session. It mirrors the setting
+  // that was current at session_start, so a mid-session toggle can never make the
+  // example call reference a tool the model has never been shown.
+  let payloadReceiveRegistered = false;
   let hardThinkingPrevious: ReturnType<ExtensionAPI["getThinkingLevel"]> | null = null;
   // Set when the user changes /thinking to a level other than "off" while a hard
   // interruption holds thinking off. The manual choice wins over the captured value.
@@ -1675,178 +1909,378 @@ export default function (pi: ExtensionAPI): void {
     };
   });
 
-  pi.registerCommand("voluntary-compaction", {
-    description: "View or edit voluntary compaction settings",
-    handler: async (_args, ctx) => {
-      if (!ctx.hasUI) {
-        ctx.ui.notify(configText(), "info");
-        return;
+  // A browse list renders every option as one Text line with no viewport, so both
+  // browsers page manually and keep each row to a single unwrapped line.
+  const BROWSE_PAGE_SIZE = 12;
+  const BROWSE_NON_UI_ROWS = 25;
+
+  async function browseRows(
+    ctx: ExtensionContext,
+    title: string,
+    rows: string[],
+    empty: string,
+  ): Promise<string | undefined> {
+    if (rows.length === 0) {
+      ctx.ui.notify(`${title}: ${empty}`, "info");
+      return undefined;
+    }
+    if (!ctx.hasUI) {
+      const shown = rows.slice(0, BROWSE_NON_UI_ROWS);
+      const hidden = rows.length - shown.length;
+      ctx.ui.notify([
+        `${title}: ${rows.length}`,
+        ...shown,
+        ...(hidden > 0 ? [`... ${hidden} more (browse in an interactive session)`] : []),
+      ].join("\n"), "info");
+      return undefined;
+    }
+
+    const pageCount = Math.ceil(rows.length / BROWSE_PAGE_SIZE);
+    let page = 0;
+    while (true) {
+      const start = page * BROWSE_PAGE_SIZE;
+      const items = rows.slice(start, start + BROWSE_PAGE_SIZE);
+      const navigation: string[] = [];
+      if (page > 0) navigation.push("◂ Previous page");
+      if (page < pageCount - 1) navigation.push("▸ Next page");
+      navigation.push("Close");
+      const selected = await ctx.ui.select(
+        `${title} · ${start + 1}-${start + items.length} of ${rows.length} · page ${page + 1}/${pageCount}`,
+        [...items, ...navigation],
+      );
+      if (selected === undefined) return undefined;
+      if (selected === "▸ Next page") {
+        page = Math.min(pageCount - 1, page + 1);
+        continue;
       }
+      if (selected === "◂ Previous page") {
+        page = Math.max(0, page - 1);
+        continue;
+      }
+      if (selected === "Close") return undefined;
+      return selected;
+    }
+  }
 
-      const edited: Config = { ...config };
-      const editedKeys = new Set<keyof Config>();
-      const fields: Array<[keyof Config, string]> = [
-        ["softThresholdPercent", "Soft threshold"],
-        ["hardThresholdPercent", "Hard threshold"],
-        ["workspaceReasoningBufferPercent", "Workspace reasoning buffer"],
-        ["maxToolOutputTokens", "Maximum tool output size"],
-        ["minimumJumpDistance", "Minimum jump distance"],
-        ["softMessage", "Soft warning message"],
-        ["hardReasoningMessage", "Hard reasoning-model message"],
-        ["hardNonReasoningMessage", "Hard non-reasoning-model message"],
-        ["instructions", `Agent instructions (${edited.instructions === null ? "package default" : "custom"})`],
-        ["advertiseVoluntaryCompaction", "Advertise voluntary compaction"],
-        ["afterTaskCompaction", "After task compaction default"],
-        ["outputMarginFloorTokens", "Forced-jump output floor"],
-        ["emergencyWriteMargin", "Emergency write margin"],
-      ];
+  async function browseCheckpointsCommand(ctx: ExtensionContext): Promise<void> {
+    const percent = workspaceUsedPercent(ctx);
+    // Only offer what the agent can actually jump to: `checkpoint_list` hides the
+    // initial checkpoint and any target that frees less than `minimumJumpDistance`
+    // while usage is above the soft threshold, so listing those here would invite a
+    // jump order the agent then has to refuse. Without usage data nothing can be
+    // judged, so every stored checkpoint stays listed.
+    const candidates = checkpointEntries(manager(ctx)).filter(({ checkpoint }) => checkpoint.id !== 0);
+    const entries = percent === null
+      ? candidates.map(({ checkpoint }) => ({ checkpoint, workspaceDelta: undefined }))
+      : eligibleJumpCheckpoints(manager(ctx), percent);
+    const rows = entries.map(({ checkpoint, workspaceDelta }) =>
+      formatCheckpointRow(checkpoint, workspaceDelta));
+    const hidden = candidates.length - entries.length;
+    const title = hidden > 0 ? `Checkpoints · ${hidden} not usable` : "Checkpoints";
+    const empty = candidates.length === 0
+      ? "no checkpoints are available on this branch"
+      : `no checkpoint is a valid jump target right now; a jump must free ${String(config.minimumJumpDistance)}% or land at or below ${String(config.softThresholdPercent)}% utilization`;
+    // A row id is unique and sits at the start of the row, so the selection maps
+    // back to its checkpoint even when a long name was ellipsized.
+    const selected = await browseRows(ctx, title, rows, empty);
+    if (selected === undefined) return;
+    const index = rows.indexOf(selected);
+    if (index < 0) return;
+    const { checkpoint } = entries[index]!;
+    // browseRows only returns a row in an interactive session, so the action
+    // dialog below always has a UI to render in.
+    const choice = await ctx.ui.select(
+      `${rows[index]}\n\nWhat should happen with this checkpoint?`,
+      ["Close", `Order a jump to #${checkpoint.id}`],
+    );
+    if (choice === undefined || choice === "Close") return;
+    orderCheckpointJump(ctx, checkpoint);
+  }
 
-      while (true) {
-        const choices = [...fields.map(([, label]) => label), "Done"];
-        const selected = await ctx.ui.select("Choose a voluntary-compaction setting to edit", choices);
-        if (!selected || selected === "Done") break;
-        const key = fields.find(([, label]) => label === selected)?.[0];
-        if (!key) continue;
-        const description = SETTING_DESCRIPTIONS[key];
+  // A user-ordered jump: the steer tells the agent which locked-in payloads it
+  // must distill before the jump wipes them. Later checkpoints are the ones the
+  // jump discards, so they are the ones worth carrying.
+  function orderCheckpointJump(ctx: ExtensionContext, checkpoint: CheckpointLabel): void {
+    const later = checkpointEntries(manager(ctx))
+      .filter(({ checkpoint: other }) => other.id > checkpoint.id)
+      .map(({ checkpoint: other }) => `'${singleLineExcerpt(other.name, CHECKPOINT_NAME_CHARACTERS)}'`);
+    const message = [
+      `[You must now jump to checkpoint #${checkpoint.id} with exhaustive payload and continue your work from there. Still-relevant information from following locked-in payloads should be distilled into the final payload.]`,
+      ...(later.length > 0 ? ["", "Checkpoints to be distilled:", ...later] : []),
+    ].join("\n");
+    try {
+      pi.sendUserMessage(message, { deliverAs: "steer" });
+      ctx.ui.notify(`Ordered a jump to checkpoint #${checkpoint.id}.`, "info");
+    } catch (error) {
+      ctx.ui.notify(`Could not order the jump: ${error instanceof Error ? error.message : String(error)}`, "error");
+    }
+  }
 
-        if (key === "instructions") {
-          const mode = await ctx.ui.select(`Agent instructions\n\n${description}`, ["Use package default", "Edit custom instructions", "Cancel"]);
-          if (mode === "Use package default") {
-            edited.instructions = null;
-            editedKeys.add(key);
-          } else if (mode === "Edit custom instructions") {
-            const value = await ctx.ui.editor(`Edit agent instructions\n\n${description}`, edited.instructions ?? defaultInstructions ?? undefined);
-            if (value != null) {
-              edited.instructions = value;
-              editedKeys.add(key);
-            }
-          }
-          continue;
-        }
+  async function browseOutputsCommand(ctx: ExtensionContext): Promise<void> {
+    const rows = [...pendingToolOutputs.entries()]
+      .sort((left, right) => left[0] - right[0])
+      .map(([id, output]) => fitOneLine(`[${id}] ${output.toolName} · ${output.label}`));
+    await browseRows(ctx, "Captured tool outputs", rows, "no tool output has been captured in this session");
+  }
 
-        if (key === "advertiseVoluntaryCompaction") {
-          const value = await ctx.ui.select(`Advertise voluntary compaction\n\n${description}`, ["Enabled", "Disabled", "Cancel"]);
-          if (value === "Enabled") {
-            edited.advertiseVoluntaryCompaction = true;
-            editedKeys.add(key);
-          } else if (value === "Disabled") {
-            edited.advertiseVoluntaryCompaction = false;
-            editedKeys.add(key);
-          }
-          continue;
-        }
+  // Pi's own /tree leaves an empty editor when an assistant entry is selected; this is the
+  // programmatic equivalent of submitting that empty editor. The empty content array is the
+  // only shape every provider converter drops: Anthropic filters whitespace-only text blocks
+  // and skips a user message with no surviving block, and the OpenAI, Google and Bedrock
+  // converters skip a user message whose content array is empty (an empty *string* becomes a
+  // single empty text block, which only Anthropic and Google drop). So nothing new reaches the
+  // model: the request ends where the jumped-to branch ended, which is assistant prefill
+  // continuation. The hidden entry itself cannot be avoided - it is how Pi starts an idle run.
+  const continueTurnCommand = async (ctx: ExtensionContext): Promise<void> => {
+    if (!ctx.isIdle()) {
+      ctx.ui.notify("The agent is already running; its turn has not ended.", "info");
+      return;
+    }
+    try {
+      pi.sendMessage({ customType: EXTENSION_TYPE, content: [], display: false }, { triggerTurn: true });
+    } catch (error) {
+      ctx.ui.notify(`Could not resume the agent: ${error instanceof Error ? error.message : String(error)}`, "error");
+    }
+  };
 
-        if (key === "afterTaskCompaction") {
-          const value = await ctx.ui.select(`After task compaction default\n\n${description}`, ["Denied", "Allowed", "Cancel"]);
-          if (value === "Denied") {
-            edited.afterTaskCompaction = "denied";
-            editedKeys.add(key);
-          } else if (value === "Allowed") {
-            edited.afterTaskCompaction = "allowed";
-            editedKeys.add(key);
-          }
-          continue;
-        }
+  const VC_SUBCOMMANDS: Array<{ name: string; description: string }> = [
+    { name: "settings", description: "Open voluntary compaction settings" },
+    { name: "checkpoints", description: "Browse available checkpoints" },
+    { name: "outputs", description: "Browse captured tool output IDs" },
+    { name: "continue", description: "Resume the agent with no new context" },
+  ];
 
-        if (key === "outputMarginFloorTokens") {
-          const current = edited.outputMarginFloorTokens;
-          const value = await ctx.ui.editor(`Edit ${selected}\n\n${description}`, current === null ? "" : String(current));
-          if (value == null) continue;
-          const trimmed = value.trim();
-          if (trimmed === "") {
-            edited.outputMarginFloorTokens = null;
-            editedKeys.add(key);
-            continue;
-          }
-          const number = Number(trimmed);
-          if (!Number.isSafeInteger(number) || number < 256 || number > 8192) {
-            ctx.ui.notify("Forced-jump output floor must be a whole number between 256 and 8192 tokens, or empty for pi's default.", "error");
-            continue;
-          }
-          edited.outputMarginFloorTokens = number;
+  function vcCommandCompletions(argumentPrefix: string) {
+    const prefix = argumentPrefix.trimStart().toLowerCase();
+    if (/\s/.test(argumentPrefix.trimStart())) return null;
+    const matches = VC_SUBCOMMANDS.filter((item) => item.name.startsWith(prefix));
+    if (matches.length === 0) return null;
+    return matches.map((item) => ({ value: item.name, label: item.name, description: item.description }));
+  }
+
+  const showSettingsCommand = async (ctx: ExtensionContext): Promise<void> => {
+    if (!ctx.hasUI) {
+      ctx.ui.notify(configText(), "info");
+      return;
+    }
+
+    const edited: Config = { ...config };
+    const editedKeys = new Set<keyof Config>();
+    const fields: Array<[keyof Config, string]> = [
+      ["softThresholdPercent", "Soft threshold"],
+      ["hardThresholdPercent", "Hard threshold"],
+      ["workspaceReasoningBufferPercent", "Workspace reasoning buffer"],
+      ["maxToolOutputTokens", "Maximum tool output size"],
+      ["minimumJumpDistance", "Minimum jump distance"],
+      ["softMessage", "Soft warning message"],
+      ["hardReasoningMessage", "Hard reasoning-model message"],
+      ["hardNonReasoningMessage", "Hard non-reasoning-model message"],
+      ["instructions", `Agent instructions (${edited.instructions === null ? "package default" : "custom"})`],
+      ["advertiseVoluntaryCompaction", "Advertise voluntary compaction"],
+      ["afterTaskCompaction", "After task compaction default"],
+      ["outputMarginFloorTokens", "Forced-jump output floor"],
+      ["emergencyWriteMargin", "Emergency write margin"],
+      ["crowdedCheckpointsLimit", "Crowded checkpoint advisory"],
+      ["toolUseTraining", "Tool use training"],
+    ];
+
+    while (true) {
+      const choices = [...fields.map(([, label]) => label), "Done"];
+      const selected = await ctx.ui.select("Choose a voluntary-compaction setting to edit", choices);
+      if (!selected || selected === "Done") break;
+      const key = fields.find(([, label]) => label === selected)?.[0];
+      if (!key) continue;
+      const description = SETTING_DESCRIPTIONS[key];
+
+      if (key === "instructions") {
+        const mode = await ctx.ui.select(`Agent instructions\n\n${description}`, ["Use package default", "Edit custom instructions", "Cancel"]);
+        if (mode === "Use package default") {
+          edited.instructions = null;
           editedKeys.add(key);
-          continue;
-        }
-
-        if (key === "emergencyWriteMargin") {
-          const value = await ctx.ui.editor(`Edit ${selected}\n\n${description}`, String(edited.emergencyWriteMargin));
-          if (value == null) continue;
-          const number = Number(value.trim());
-          if (!Number.isSafeInteger(number) || number < 0 || number > 32768) {
-            ctx.ui.notify("Emergency write margin must be a whole number between 0 and 32768 tokens.", "error");
-            continue;
-          }
-          edited.emergencyWriteMargin = number;
-          editedKeys.add(key);
-          continue;
-        }
-
-        if (key === "softThresholdPercent" || key === "hardThresholdPercent" || key === "workspaceReasoningBufferPercent" || key === "maxToolOutputTokens" || key === "minimumJumpDistance") {
-          const value = await ctx.ui.editor(`Edit ${selected}\n\n${description}`, String(edited[key]));
-          if (value == null) continue;
-          const number = Number(value);
-          const maximum = key === "workspaceReasoningBufferPercent" ? 25 : 100;
-          const invalidMaxToolOutput = key === "maxToolOutputTokens" && (!Number.isSafeInteger(number) || number < 1);
-          if (invalidMaxToolOutput || !Number.isFinite(number) || (key !== "maxToolOutputTokens" && (number < 0 || number > maximum))) {
-            ctx.ui.notify(key === "workspaceReasoningBufferPercent"
-              ? "Workspace reasoning buffer must be between 0 and 25% in context."
-              : key === "minimumJumpDistance"
-                ? "Minimum jump distance must be between 0 and 100%."
-                : key === "maxToolOutputTokens"
-                  ? "Maximum tool output size must be a positive whole number of tokens."
-                  : "Thresholds must be numbers between 0 and 100.", "error");
-          } else {
-            edited[key] = number;
-            editedKeys.add(key);
-          }
-        } else {
-          const value = await ctx.ui.editor(`Edit ${selected}\n\n${description}`, edited[key]);
+        } else if (mode === "Edit custom instructions") {
+          const value = await ctx.ui.editor(`Edit agent instructions\n\n${description}`, edited.instructions ?? defaultInstructions ?? undefined);
           if (value != null) {
-            edited[key] = value;
+            edited.instructions = value;
             editedKeys.add(key);
           }
         }
+        continue;
+      }
 
-        if (!(edited.softThresholdPercent < edited.hardThresholdPercent)) {
-          ctx.ui.notify("The soft threshold must remain below the hard threshold.", "error");
+      if (key === "advertiseVoluntaryCompaction") {
+        const value = await ctx.ui.select(`Advertise voluntary compaction\n\n${description}`, ["Enabled", "Disabled", "Cancel"]);
+        if (value === "Enabled") {
+          edited.advertiseVoluntaryCompaction = true;
+          editedKeys.add(key);
+        } else if (value === "Disabled") {
+          edited.advertiseVoluntaryCompaction = false;
+          editedKeys.add(key);
+        }
+        continue;
+      }
+
+      if (key === "toolUseTraining") {
+        const value = await ctx.ui.select(`Tool use training\n\n${description}`, ["Enabled", "Disabled", "Cancel"]);
+        if (value === "Enabled") {
+          edited.toolUseTraining = true;
+          editedKeys.add(key);
+          ctx.ui.notify("Tool use training registers payload_receive at the next session start.", "info");
+        } else if (value === "Disabled") {
+          edited.toolUseTraining = false;
+          editedKeys.add(key);
+          ctx.ui.notify("Tool use training is off: payload_receive stays unregistered and unadvertised from the next session start.", "info");
+        }
+        continue;
+      }
+
+      if (key === "afterTaskCompaction") {
+        const value = await ctx.ui.select(`After task compaction default\n\n${description}`, ["Denied", "Allowed", "Cancel"]);
+        if (value === "Denied") {
+          edited.afterTaskCompaction = "denied";
+          editedKeys.add(key);
+        } else if (value === "Allowed") {
+          edited.afterTaskCompaction = "allowed";
+          editedKeys.add(key);
+        }
+        continue;
+      }
+
+      if (key === "outputMarginFloorTokens") {
+        const current = edited.outputMarginFloorTokens;
+        const value = await ctx.ui.editor(`Edit ${selected}\n\n${description}`, current === null ? "" : String(current));
+        if (value == null) continue;
+        const trimmed = value.trim();
+        if (trimmed === "") {
+          edited.outputMarginFloorTokens = null;
+          editedKeys.add(key);
+          continue;
+        }
+        const number = Number(trimmed);
+        if (!Number.isSafeInteger(number) || number < 256 || number > 8192) {
+          ctx.ui.notify("Forced-jump output floor must be a whole number between 256 and 8192 tokens, or empty for pi's default.", "error");
+          continue;
+        }
+        edited.outputMarginFloorTokens = number;
+        editedKeys.add(key);
+        continue;
+      }
+
+      if (key === "emergencyWriteMargin") {
+        const value = await ctx.ui.editor(`Edit ${selected}\n\n${description}`, String(edited.emergencyWriteMargin));
+        if (value == null) continue;
+        const number = Number(value.trim());
+        if (!Number.isSafeInteger(number) || number < 0 || number > 32768) {
+          ctx.ui.notify("Emergency write margin must be a whole number between 0 and 32768 tokens.", "error");
+          continue;
+        }
+        edited.emergencyWriteMargin = number;
+        editedKeys.add(key);
+        continue;
+      }
+
+      if (key === "crowdedCheckpointsLimit") {
+        const value = await ctx.ui.editor(`Edit ${selected}\n\n${description}`, String(edited.crowdedCheckpointsLimit));
+        if (value == null) continue;
+        const number = Number(value.trim());
+        if (!Number.isSafeInteger(number) || number < 1 || number > 1000) {
+          ctx.ui.notify("Crowded checkpoint advisory must be a whole number between 1 and 1000 checkpoints.", "error");
+          continue;
+        }
+        edited.crowdedCheckpointsLimit = number;
+        editedKeys.add(key);
+        continue;
+      }
+
+      if (key === "softThresholdPercent" || key === "hardThresholdPercent" || key === "workspaceReasoningBufferPercent" || key === "maxToolOutputTokens" || key === "minimumJumpDistance") {
+        const value = await ctx.ui.editor(`Edit ${selected}\n\n${description}`, String(edited[key]));
+        if (value == null) continue;
+        const number = Number(value);
+        const maximum = key === "workspaceReasoningBufferPercent" ? 25 : 100;
+        const invalidMaxToolOutput = key === "maxToolOutputTokens" && (!Number.isSafeInteger(number) || number < 1);
+        if (invalidMaxToolOutput || !Number.isFinite(number) || (key !== "maxToolOutputTokens" && (number < 0 || number > maximum))) {
+          ctx.ui.notify(key === "workspaceReasoningBufferPercent"
+            ? "Workspace reasoning buffer must be between 0 and 25% in context."
+            : key === "minimumJumpDistance"
+              ? "Minimum jump distance must be between 0 and 100%."
+              : key === "maxToolOutputTokens"
+                ? "Maximum tool output size must be a positive whole number of tokens."
+                : "Thresholds must be numbers between 0 and 100.", "error");
+        } else {
+          edited[key] = number;
+          editedKeys.add(key);
+        }
+      } else {
+        const value = await ctx.ui.editor(`Edit ${selected}\n\n${description}`, edited[key]);
+        if (value != null) {
+          edited[key] = value;
+          editedKeys.add(key);
         }
       }
 
-      if (!validConfig(edited)) {
-        ctx.ui.notify("Settings were not saved: check the thresholds, workspace reasoning buffer, maximum tool output size, and minimum jump distance.", "error");
+      if (!(edited.softThresholdPercent < edited.hardThresholdPercent)) {
+        ctx.ui.notify("The soft threshold must remain below the hard threshold.", "error");
+      }
+    }
+
+    if (!validConfig(edited)) {
+      ctx.ui.notify("Settings were not saved: check the thresholds, workspace reasoning buffer, maximum tool output size, and minimum jump distance.", "error");
+      return;
+    }
+    const scope = await ctx.ui.select("Apply voluntary compaction settings to", [
+      "Session only", "Project settings", "Global settings", "Cancel",
+    ]);
+    if (!scope || scope === "Cancel") return;
+
+    const overrides: ConfigOverrides = scope === "Session only"
+      ? sessionOverrides(ctx)
+      : scope === "Project settings"
+        ? (readConfigFile(join(ctx.cwd, ".pi", "settings.json")) ?? {})
+        : (readConfigFile(join(homedir(), ".pi", "agent", "settings.json")) ?? {});
+    for (const key of editedKeys) {
+      if (edited[key] === DEFAULT_CONFIG[key]) delete overrides[key];
+      else overrides[key] = edited[key] as never;
+    }
+    try {
+      if (scope === "Session only") {
+        pi.appendEntry(CONFIG_ENTRY_TYPE, overrides);
+      } else if (scope === "Project settings") {
+        if (!ctx.isProjectTrusted()) {
+          ctx.ui.notify("Project settings require a trusted project.", "error");
+          return;
+        }
+        saveConfigFile(join(ctx.cwd, ".pi", "settings.json"), overrides);
+      } else {
+        saveConfigFile(join(homedir(), ".pi", "agent", "settings.json"), overrides);
+      }
+      loadSavedConfig(ctx);
+      ctx.ui.notify(`${scope} updated. ${Object.keys(overrides).length} override(s) saved.`, "info");
+    } catch (error) {
+      ctx.ui.notify(`Could not save settings: ${error instanceof Error ? error.message : String(error)}`, "error");
+    }
+  };
+
+  pi.registerCommand("vc", {
+    description: "Voluntary compaction: settings, checkpoints, captured outputs, resume",
+    getArgumentCompletions: (argumentPrefix) => vcCommandCompletions(argumentPrefix),
+    handler: async (args, ctx) => {
+      const subcommand = args.trim().split(/\s+/)[0]?.toLowerCase() ?? "";
+      if (subcommand === "" || subcommand === "settings") {
+        await showSettingsCommand(ctx);
         return;
       }
-      const scope = await ctx.ui.select("Apply voluntary compaction settings to", [
-        "Session only", "Project settings", "Global settings", "Cancel",
-      ]);
-      if (!scope || scope === "Cancel") return;
-
-      const overrides: ConfigOverrides = scope === "Session only"
-        ? sessionOverrides(ctx)
-        : scope === "Project settings"
-          ? (readConfigFile(join(ctx.cwd, ".pi", "settings.json")) ?? {})
-          : (readConfigFile(join(homedir(), ".pi", "agent", "settings.json")) ?? {});
-      for (const key of editedKeys) {
-        if (edited[key] === DEFAULT_CONFIG[key]) delete overrides[key];
-        else overrides[key] = edited[key] as never;
+      if (subcommand === "checkpoints") {
+        await browseCheckpointsCommand(ctx);
+        return;
       }
-      try {
-        if (scope === "Session only") {
-          pi.appendEntry(CONFIG_ENTRY_TYPE, overrides);
-        } else if (scope === "Project settings") {
-          if (!ctx.isProjectTrusted()) {
-            ctx.ui.notify("Project settings require a trusted project.", "error");
-            return;
-          }
-          saveConfigFile(join(ctx.cwd, ".pi", "settings.json"), overrides);
-        } else {
-          saveConfigFile(join(homedir(), ".pi", "agent", "settings.json"), overrides);
-        }
-        loadSavedConfig(ctx);
-        ctx.ui.notify(`${scope} updated. ${Object.keys(overrides).length} override(s) saved.`, "info");
-      } catch (error) {
-        ctx.ui.notify(`Could not save settings: ${error instanceof Error ? error.message : String(error)}`, "error");
+      if (subcommand === "outputs") {
+        await browseOutputsCommand(ctx);
+        return;
       }
+      if (subcommand === "continue") {
+        await continueTurnCommand(ctx);
+        return;
+      }
+      ctx.ui.notify(`Unknown /vc subcommand "${subcommand}". Use settings, checkpoints, outputs or continue.`, "error");
     },
   });
 
@@ -1971,7 +2405,7 @@ ${checkpointListForInterruption(ctx)}`;
 
   const invalidJumpTargetResult = (ctx: ExtensionContext) => {
     if (ctx.hasUI) ctx.ui.notify("Checkpoint jump suppressed.", "warning");
-    return textResult(`This checkpoint is invalid target, because the workspace utilization delta is too low.\n\nAvailable checkpoints (use one of these IDs; do not call checkpoint_list):\n${checkpointListForInterruption(ctx)}`);
+    return textResult(`This checkpoint is an invalid target, because the workspace utilization delta is too low.\n\nAvailable checkpoints (use one of these IDs; do not call checkpoint_list):\n${checkpointListForInterruption(ctx)}`);
   };
 
   const jumpTargetMeetsMinimumDistance = (sm: SessionManager, targetId: number, ctx: ExtensionContext): boolean => {
@@ -2436,6 +2870,10 @@ ${checkpointListForInterruption(ctx)}`;
     stopAutoCompactionWatchers();
     lastAutoCompactionEnabled = null;
     loadSavedConfig(ctx);
+    // Registration follows the setting that this session resolved. Off means the
+    // tool is absent from the registry and therefore unadvertised; switching it back
+    // on needs a new session (or a pi restart), since Pi has no tool unregistration.
+    if (config.toolUseTraining && !payloadReceiveRegistered) registerPayloadReceiveTool();
     pendingToolOutputs.clear();
     clippedReads.clear();
     nextToolOutputId = 1;
@@ -2620,15 +3058,21 @@ ${checkpointListForInterruption(ctx)}`;
       details: (event as any).details,
       estimatedTokens,
       lineCount,
+      toolName: event.toolName,
+      label: outputLabel(event.toolName, event.input, bufferedContent),
+      carrierToolCallId: event.toolCallId,
     };
     const pageBudget = workspaceTokens === null
       ? config.maxToolOutputTokens
       : Math.min(Math.max(0, workspaceTokens), config.maxToolOutputTokens);
     pendingToolOutputs.set(id, output);
     if (pageBudget <= 0) {
-      // Workspace is exhausted. The full result stays buffered in memory, but a
-      // multi-line notice would add tokens to an already saturated context on
-      // every tool round; keep the shortest actionable directive instead.
+      // Workspace is exhausted. The full result stays buffered in memory. The
+      // notice names the tool output as what failed and states the recovery
+      // recipe: a terse internal term ("0-token budget") reads as a verdict on
+      // the call itself, so the agent concludes a subagent produced nothing and
+      // moves on. This branch is rare - `outputMarginFloorTokens` normally
+      // guarantees room - so the extra tokens cost less than that mistake.
       triggerHardInterruption(ctx, true);
       // No "keep the payload brief" hint here on purpose. A short payload under
       // output pressure turns a recoverable stall into a lossy jump that throws
@@ -2642,7 +3086,7 @@ ${checkpointListForInterruption(ctx)}`;
       return {
         content: [{
           type: "text" as const,
-          text: `[0-token budget: jump now. Output retained as ID ${id}.]`,
+          text: `[Tool output is too large to fit in available workspace; retained as ID ${id}. Jump to an earlier checkpoint, then call 'output_receive_paginate' with id ${id}, offset 1 and no limit.]`,
         }],
         details: { outputId: id, totalLines: lineCount },
       };
@@ -2655,7 +3099,7 @@ ${checkpointListForInterruption(ctx)}`;
       return {
         content: [{
           type: "text" as const,
-          text: `[Tool output is about ${estimatedTokens} tokens; no complete line fits within the current ${pageBudget}-token budget. Output is retained as ID ${id}. Jump to an earlier checkpoint, then call 'output_receive_paginate' with id ${id}, offset 1 and no limit.]`,
+          text: `[Tool output is ${estimatedTokens} tokens; no complete line fits in available workspace. Output is retained as ID ${id}. Jump to an earlier checkpoint, then call 'output_receive_paginate' with id ${id}, offset 1 and no limit.]`,
         }],
         details: { outputId: id, totalLines: lineCount },
       };
@@ -2998,7 +3442,33 @@ ${checkpointListForInterruption(ctx)}`;
       }];
       assistantBumpPending = false;
     }
-    return messages === event.messages ? undefined : { messages };
+    // Pre-tool training: a jump wipes the recent native tool-call exchanges that
+    // primed the model, so its first post-jump turn faces prose only and a heavily
+    // quantized model sometimes answers with tool-call markup printed as text. Put
+    // one completed call in front of it instead of asking for good behavior. The
+    // pair lives only in this request payload: nothing reaches the transcript, the
+    // TUI or later replays, and no `message_end` fires for it.
+    if (postJumpExamplePending && ctx.model && messages.at(-1)?.role !== "assistant") {
+      postJumpExamplePending = false;
+      const exampleTargetId = postJumpExampleTargetId;
+      postJumpExampleTargetId = null;
+      const toolCallId = `${PAYLOAD_RECEIVE_TOOL}-${++payloadReceiveExampleSeq}`;
+      const emptyUsage = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0, cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } };
+      messages = [...messages, {
+        role: "assistant" as const,
+        content: [{ type: "toolCall" as const, id: toolCallId, name: PAYLOAD_RECEIVE_TOOL, arguments: { checkpoint_id: exampleTargetId ?? 0 } }],
+        api: ctx.model.api, provider: ctx.model.provider, model: ctx.model.id,
+        usage: emptyUsage,
+        stopReason: "toolUse" as const, timestamp: Date.now(),
+      }, {
+        role: "toolResult" as const,
+        toolCallId, toolName: PAYLOAD_RECEIVE_TOOL,
+        content: [{ type: "text" as const, text: POST_JUMP_ADVISORY }],
+        isError: false, timestamp: Date.now(),
+      }];
+    }
+    const labelled = labelBranchSummariesAsPayloads(messages as any[]) as typeof messages;
+    return labelled === messages ? undefined : { messages: labelled };
   });
 
   // Hard pressure means the agent owes a checkpoint jump and its payload must
@@ -3162,7 +3632,7 @@ ${checkpointListForInterruption(ctx)}`;
     execute: createCheckpoint,
   });
 
-  const listParams = Type.Object({ limit: Type.Optional(Type.Number({ description: "Maximum checkpoints to show (default: 50)." })) });
+  const listParams = Type.Object({});
   pi.registerTool({
     ...readLoadoutOverride,
     name: "checkpoint_list", label: "List available checkpoints",
@@ -3170,12 +3640,18 @@ ${checkpointListForInterruption(ctx)}`;
     promptSnippet: "List available checkpoints, their IDs, workspace utilization at the time the checkpoint was created and workspace utilization delta from current state.",
     promptGuidelines: ["Chose a suitable jump target; balance freeing sufficient part of the workspace while retaining knowledge locked-in by secondary accumulation checkpoints. Do not automatically target the lowest utilization - be strategic."],
     parameters: listParams,
-    async execute(_id, params: Static<typeof listParams>, _signal, _update, ctx) {
+    async execute(_id, _params: Static<typeof listParams>, _signal, _update, ctx) {
       const sm = manager(ctx);
-      const limit = Math.max(1, Math.floor(params.limit ?? 50));
-      const checkpoints = eligibleJumpCheckpoints(sm, workspaceUsedPercent(ctx)).slice(-limit);
+      // Every checkpoint the user can see is a reasonable jump target on a multi-day
+      // task, so the list is never truncated; a crowded session says so instead.
+      const checkpoints = eligibleJumpCheckpoints(sm, workspaceUsedPercent(ctx));
       const lines = checkpoints.map(({ checkpoint, workspaceDelta }) =>
         formatCheckpointLabel(checkpoint, workspaceDelta));
+      const used = usagePercent(ctx);
+      if (checkpoints.length > config.crowdedCheckpointsLimit
+        && (used ?? 0) < config.hardThresholdPercent) {
+        lines.push("", `[There is a large number of checkpoints with locked-in payload. You should jump to earliest checkpoint available (#${checkpoints[0]!.checkpoint.id}) and distill all your locked-in checkpoints and current state into one payload; then lock-in the combined payload after jump.]`);
+      }
       return textResult(lines.join("\n") || "(no checkpoints with sufficient workspace utilization difference)");
     },
   });
@@ -3315,7 +3791,7 @@ ${checkpointListForInterruption(ctx)}`;
     parameters: receivePaginateParams,
     renderCall(args, theme) { return renderReceiveCall("output_receive_paginate", args, theme); },
     renderResult: renderReceivePageResult,
-    async execute(_toolCallId, params: Static<typeof receivePaginateParams>, _signal, _update, ctx) {
+    async execute(toolCallId, params: Static<typeof receivePaginateParams>, _signal, _update, ctx) {
       const output = pendingToolOutputs.get(params.id);
       if (!output) return textResult(`Requested output ID ${params.id} was not found.`);
       const offset = Math.max(1, Math.floor(params.offset));
@@ -3341,7 +3817,11 @@ ${checkpointListForInterruption(ctx)}`;
       const requestedLines = Math.min(limit, remainingLines);
       const pageText = paginateContentByLines(output.content, offset, requestedLines);
       const pageLines = requestedLines;
-      const resultText = formatOutputPage(pageText, params.id, offset, pageLines, output.lineCount);
+      const restateSize = shouldRestateOutputSize(manager(ctx), output);
+      // The limit the agent asked for, not the lines actually handed over: the difference
+      // is what tells a read that ran past the end from one that stopped on the last line.
+      const requestedEnd = params.limit === undefined ? undefined : offset + limit - 1;
+      const resultText = formatOutputPage(pageText, params.id, offset, pageLines, output.lineCount, undefined, restateSize, requestedEnd);
       if (workspaceTokens <= 0 || estimateTextTokens(resultText) > workspaceTokens) {
         const recommendedPage = outputPageWithinBudget(output, params.id, offset, Math.max(0, workspaceTokens));
         if (!recommendedPage) {
@@ -3349,6 +3829,9 @@ ${checkpointListForInterruption(ctx)}`;
         }
         return textResult(`The requested page does not fit in available workspace. Option 1: Retry with ${recommendedPage.lineCount} line limit that currently fits; Option 2: Jump to a previous checkpoint; then retry this 'output_receive_paginate' call.`);
       }
+      // Commit the anchor only once the page is actually accepted, so a rejected page
+      // cannot consume the one advisory that a later jump would have needed.
+      if (restateSize) markOutputSizeNoticeDelivered(output, toolCallId);
       return {
         content: [{ type: "text" as const, text: resultText }],
         details: {
@@ -3361,6 +3844,28 @@ ${checkpointListForInterruption(ctx)}`;
       };
     },
   });
+
+  // Replace Pi's built-in bash tool. The built-in returns only the last 2,000
+  // lines / 50 KB and names a temp file for the rest; voluntary compaction
+  // accepts the complete output and paginates it against the live workspace.
+  // Training example tool. Called from session_start, where the stored setting is
+  // already resolved: with training off it is never registered, so neither the tool
+  // list nor the prompt hints at it. The agent may run it out of curiosity; the
+  // answer never depends on the arguments, so any parameters it invents are safe.
+  function registerPayloadReceiveTool(): void {
+    payloadReceiveRegistered = true;
+    pi.registerTool({
+      ...readLoadoutOverride,
+      name: PAYLOAD_RECEIVE_TOOL, label: "Payload receive",
+      description: "Accept the pending payload; only run once.",
+      parameters: Type.Object({
+        checkpoint_id: Type.Optional(Type.Number({ multipleOf: 1, description: "Original target checkpoint." })),
+      }),
+      async execute() {
+        return textResult(PAYLOAD_RECEIVE_RESULT);
+      },
+    });
+  }
 
   // Replace Pi's built-in bash tool. The built-in returns only the last 2,000
   // lines / 50 KB and names a temp file for the rest; voluntary compaction
@@ -3467,7 +3972,16 @@ ${checkpointListForInterruption(ctx)}`;
             // This avoids losing the trigger when the runtime is still completing
             // the terminating turn that contained checkpoint_jump.
             setTimeout(() => {
-              pi.sendMessage({ customType: EXTENSION_TYPE, content: "checkpoint_jump completed and the payload is active. Resume the task from its next step now. When action is needed, use the registered tools through real tool calls; do not print tool-call/XML markup as text.", display: false }, { triggerTurn: true, deliverAs: "followUp" });
+              // With pre-tool training on and its tool registered, the advisory
+              // arrives as the example call's output, so this message only starts the
+              // turn (empty content is the same shape a user-ordered jump already sends).
+              if (config.toolUseTraining && payloadReceiveRegistered) {
+                postJumpExamplePending = true;
+                postJumpExampleTargetId = request.checkpointId;
+                pi.sendMessage({ customType: EXTENSION_TYPE, content: [], display: false }, { triggerTurn: true, deliverAs: "followUp" });
+              } else {
+                pi.sendMessage({ customType: EXTENSION_TYPE, content: POST_JUMP_ADVISORY_LEGACY, display: false }, { triggerTurn: true, deliverAs: "followUp" });
+              }
             }, 0);
           }
         }
