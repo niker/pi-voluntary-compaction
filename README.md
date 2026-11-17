@@ -62,7 +62,7 @@ The default settings are:
 | Reasoning buffer | 2.5% |
 | Large tool output limit before it is force paginated | 8,000 estimated tokens |
 | Minimum distance between checkpoint jumps | 7.5% |
-| Emergency write margin | 3,000 tokens |
+| Emergency write margin | 6,000 tokens |
 
 **Soft limit** is only advisory, agent is informed it should wrap up any ongoing task and jump.
 
