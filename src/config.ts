@@ -34,7 +34,7 @@ export type Config = {
    * of the reasoning-model notice: an ongoing write and thinking before a jump
    * put it in jeopardy the same way, so both get the same answer. Unlike every
    * other threshold this one is measured from the context window ceiling, not
-   * from the hard percent. Default 3000. Range: 0-32768.
+   * from the hard percent. Default 6000. Range: 0-32768.
    */
   emergencyWriteMargin: number;
   /**
@@ -75,7 +75,7 @@ export const DEFAULT_CONFIG: Config = {
   advertiseVoluntaryCompaction: true,
   afterTaskCompaction: "allowed",
   outputMarginFloorTokens: 256,
-  emergencyWriteMargin: 4000,
+  emergencyWriteMargin: 6000,
   crowdedCheckpointsLimit: 10,
   toolUseTraining: true,
 };
