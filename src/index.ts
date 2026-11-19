@@ -171,6 +171,81 @@ function checkpointJumpStreamState(message: any, finalized = false): CheckpointJ
   return jumpCandidate && !unresolvedName ? "jump" : "other";
 }
 const manager = (ctx: ExtensionContext) => ctx.sessionManager as unknown as SessionManager;
+
+/**
+ * Hard threshold that governs the current session. A headless subagent runs the lower
+ * `headlessHardThresholdPercent`: its reasoning turn cannot be interrupted, so a thinking
+ * step that starts close to the ceiling is the failure condition this extension has left,
+ * and the wider buffer is what keeps the forced jump inside the output margin. Every
+ * headless figure — workspace percentage, retrieval budget, tool-output advisory,
+ * pagination, read chunk sizing — derives from this value instead of the main one, so the
+ * child never believes it has room the parent would consider exhausted.
+ */
+function hardThresholdPercentFromSm(sm: { getSessionId(): string }): number {
+  if (!isHeadlessSession(sm)) return config.hardThresholdPercent;
+  const headless = config.headlessHardThresholdPercent;
+  if (!Number.isFinite(headless) || headless <= 0) return config.hardThresholdPercent;
+  return Math.min(headless, config.hardThresholdPercent);
+}
+
+function hardThresholdPercentFor(ctx: ExtensionContext): number {
+  return hardThresholdPercentFromSm(manager(ctx));
+}
+
+/**
+ * Reasoning buffer that applies to the current session. A headless child turns thinking off when
+ * its hard limit fires, so no reasoning turn has to fit under that threshold; withholding the
+ * buffer anyway made its label saturate and its read budget run out about 2.5 points before the
+ * hard trigger, leaving a dead band where every read was refused and `checkpoint_create` reported
+ * 100 % while pressure stayed soft. A child therefore measures every workspace figure against its
+ * hard threshold itself, so the label, the read budget and the forced jump all trip at the same
+ * instant.
+ */
+function reasoningBufferPercentFor(ctx: ExtensionContext): number {
+  return isHeadlessSession(manager(ctx)) ? 0 : config.workspaceReasoningBufferPercent;
+}
+
+/**
+ * Soft advisory threshold that governs the current session. A headless child runs the lower
+ * `headlessSoftThresholdPercent`: it has no emergency band and its reasoning cannot be interrupted,
+ * so the advisory fires earlier and the whole span down to the child's hard limit is left to the
+ * forced jump payload.
+ */
+function softThresholdPercentFromSm(sm: { getSessionId(): string }): number {
+  if (!isHeadlessSession(sm)) return config.softThresholdPercent;
+  const headless = config.headlessSoftThresholdPercent;
+  if (!Number.isFinite(headless) || headless < 0) return config.softThresholdPercent;
+  return Math.min(headless, hardThresholdPercentFromSm(sm));
+}
+
+function softThresholdPercentFor(ctx: ExtensionContext): number {
+  return softThresholdPercentFromSm(manager(ctx));
+}
+
+// True when the run that just ended cannot hand its parent an answer: no assistant
+// response at all, one the runtime aborted or failed, or an empty stream (no text
+// and no tool call). bug1: the hard-limit abort replaced both the verification
+// command and the answer turn, so the child's last assistant message was empty and
+// pi-subagents reported the extension's own notice as the subagent result.
+function runEndedWithoutAnswer(sm: SessionManager): boolean {
+  const branch = sm.getBranch();
+  for (let index = branch.length - 1; index >= 0; index--) {
+    const entry = branch[index] as unknown as Record<string, any>;
+    if (!entry || entry.type !== "message") continue;
+    const message = entry.message as Record<string, any> | undefined;
+    if (!message || message.role !== "assistant") continue;
+    if (message.stopReason === "aborted" || message.stopReason === "error") return true;
+    const content = Array.isArray(message.content)
+      ? message.content as Array<Record<string, any>>
+      : typeof message.content === "string" ? [{ type: "text", text: message.content }] : [];
+    const hasText = content.some((part) => part
+      && (part.type === "text" || part.type === "thinking")
+      && String(part.text ?? part.thinking ?? "").trim().length > 0);
+    const hasToolCall = content.some((part) => part && (part.type === "toolCall" || part.type === "tool_use"));
+    return !hasText && !hasToolCall;
+  }
+  return true;
+}
 const textResult = (text: string) => ({ content: [{ type: "text" as const, text }], details: {} });
 // A jump payload is the only state that survives the branch prune. Weak models
 // sometimes submit a placeholder (e.g. "-- payload omited --") instead of real
@@ -593,7 +668,7 @@ function workspaceUsedPercent(ctx: ExtensionContext): number | null {
   const usage = ctx.getContextUsage();
   if (!usage || usage.contextWindow <= 0) return null;
   const tokens = usage.tokens ?? (usage.percent == null ? null : usage.percent / 100 * usage.contextWindow);
-  const capacityPercent = config.hardThresholdPercent - config.workspaceReasoningBufferPercent;
+  const capacityPercent = hardThresholdPercentFor(ctx) - reasoningBufferPercentFor(ctx);
   if (tokens == null || !Number.isFinite(tokens) || capacityPercent <= 0) return null;
   const capacityTokens = usage.contextWindow * capacityPercent / 100;
   // This percentage is only shown to the agent. Remove the fixed prompt prefix
@@ -625,7 +700,7 @@ function retrievalWorkspaceTokens(ctx: ExtensionContext): number | null {
   const measured = measuredContextTokens(ctx);
   const tokens = measured != null && Number.isFinite(measured) ? measured : reported;
   if (tokens == null || !Number.isFinite(tokens)) return null;
-  return Math.floor(usage.contextWindow * config.hardThresholdPercent / 100 - tokens);
+  return Math.floor(usage.contextWindow * hardThresholdPercentFor(ctx) / 100 - tokens);
 }
 
 // pi reports context usage as a structure-blind chars/4 count over the message
@@ -824,7 +899,9 @@ function ceilingWorkspaceTokens(ctx: ExtensionContext): number | null {
 // plus the follow-up pagination call) and an envelope sliver for the page
 // footer, refusal-notice text, and pi's tool-result framing — the advisory
 // line counter measures raw lines only, so without this reserve the quoted
-// page size is structurally too big and retries ratchet downward.
+// page size is structurally too big and retries ratchet downward. The reserve
+// is the only subtraction a headless child gets: it turns thinking off at its
+// hard limit, so its read budget runs down exactly where the jump is forced.
 const ADVISORY_ENVELOPE_RESERVE_TOKENS = 256;
 
 function advisoryWorkspaceTokens(ctx: ExtensionContext): number | null {
@@ -832,7 +909,7 @@ function advisoryWorkspaceTokens(ctx: ExtensionContext): number | null {
   if (raw === null) return null;
   const usage = ctx.getContextUsage();
   const reasoningReserve = usage && usage.contextWindow > 0
-    ? Math.floor(usage.contextWindow * config.workspaceReasoningBufferPercent / 100)
+    ? Math.floor(usage.contextWindow * reasoningBufferPercentFor(ctx) / 100)
     : 0;
   return Math.max(0, raw - reasoningReserve - ADVISORY_ENVELOPE_RESERVE_TOKENS);
 }
@@ -1050,10 +1127,14 @@ function checkpointWorkspaceDelta(checkpoint: CheckpointLabel, currentWorkspaceP
   return currentWorkspacePercent - checkpoint.workspaceUsedPercent;
 }
 
-function checkpointMeetsMinimumJumpDistance(checkpoint: CheckpointLabel, currentWorkspacePercent: number | null): boolean {
+function checkpointMeetsMinimumJumpDistance(
+  checkpoint: CheckpointLabel,
+  currentWorkspacePercent: number | null,
+  softPercent: number = config.softThresholdPercent,
+): boolean {
   const delta = checkpointWorkspaceDelta(checkpoint, currentWorkspacePercent);
   if (delta === undefined || checkpoint.workspaceUsedPercent === undefined) return false;
-  return checkpoint.workspaceUsedPercent <= config.softThresholdPercent || delta >= config.minimumJumpDistance;
+  return checkpoint.workspaceUsedPercent <= softPercent || delta >= config.minimumJumpDistance;
 }
 
 function eligibleJumpCheckpoints(
@@ -1069,7 +1150,7 @@ function eligibleJumpCheckpoints(
       workspaceDelta: checkpointWorkspaceDelta(checkpoint, currentWorkspacePercent),
     }))
     .filter((entry): entry is { checkpoint: CheckpointLabel; targetId: string; workspaceDelta: number } =>
-      entry.workspaceDelta !== undefined && checkpointMeetsMinimumJumpDistance(entry.checkpoint, currentWorkspacePercent))
+      entry.workspaceDelta !== undefined && checkpointMeetsMinimumJumpDistance(entry.checkpoint, currentWorkspacePercent, softThresholdPercentFromSm(sm)))
     .sort((left, right) => left.checkpoint.id - right.checkpoint.id);
 }
 
@@ -1077,6 +1158,29 @@ function resolveCheckpointId(sm: SessionManager, id: number): string | undefined
   const targetId = checkpointEntries(sm).find((item) => item.checkpoint.id === id)?.targetId;
   if (!targetId) return undefined;
   return sm.getEntry(targetId) ? targetId : undefined;
+}
+
+/**
+ * Target for a headless jump whose requested checkpoint is unusable. A child
+ * cannot ask the user to pick another ID, so an invalid target is a dead end:
+ * the tree stays in place and pressure keeps climbing until the child stalls.
+ * Prefer the earliest checkpoint that still frees real workspace — one recorded
+ * below `headlessAutoJumpMaxWorkspacePercent` — and fall back to checkpoint 0,
+ * which holds only the master's assignment and is therefore always small.
+ */
+function headlessFallbackJumpTarget(
+  sm: SessionManager,
+): { id: number; targetId: string } | undefined {
+  let emergency: { id: number; targetId: string } | undefined;
+  for (const { checkpoint, targetId } of checkpointEntries(sm)) {
+    if (!sm.getEntry(targetId)) continue;
+    const percentage = checkpoint.workspaceUsedPercent;
+    if (percentage !== undefined && percentage < config.headlessAutoJumpMaxWorkspacePercent) {
+      return { id: checkpoint.id, targetId };
+    }
+    if (checkpoint.id === 0) emergency = { id: 0, targetId };
+  }
+  return emergency;
 }
 
 function branchWithCheckpointVisibilitySnapshot(
@@ -1154,7 +1258,7 @@ function loadHeadlessAgentInstructions(fallback: string | null): string | null {
 }
 
 const CONFIG_KEYS: (keyof Config)[] = [
-  "softThresholdPercent", "hardThresholdPercent", "workspaceReasoningBufferPercent", "maxToolOutputTokens", "minimumJumpDistance", "softMessage",
+  "softThresholdPercent", "hardThresholdPercent", "headlessSoftThresholdPercent", "headlessHardThresholdPercent", "headlessAutoJumpMaxWorkspacePercent", "workspaceReasoningBufferPercent", "maxToolOutputTokens", "minimumJumpDistance", "softMessage",
   "hardReasoningMessage", "hardNonReasoningMessage", "instructions",
   "advertiseVoluntaryCompaction", "afterTaskCompaction", "outputMarginFloorTokens", "emergencyWriteMargin",
   "crowdedCheckpointsLimit", "toolUseTraining",
@@ -1176,6 +1280,19 @@ function validConfig(value: any): value is Config {
     && value.softThresholdPercent >= 0
     && value.softThresholdPercent < value.hardThresholdPercent
     && value.hardThresholdPercent <= 100
+    // Headless keys postdate older stored configs; a missing value keeps the default.
+    && (value.headlessSoftThresholdPercent === undefined
+      || (Number.isFinite(value.headlessSoftThresholdPercent)
+        && value.headlessSoftThresholdPercent >= 0
+        && value.headlessSoftThresholdPercent <= 100))
+    && (value.headlessHardThresholdPercent === undefined
+      || (Number.isFinite(value.headlessHardThresholdPercent)
+        && value.headlessHardThresholdPercent > 0
+        && value.headlessHardThresholdPercent <= 100))
+    && (value.headlessAutoJumpMaxWorkspacePercent === undefined
+      || (Number.isFinite(value.headlessAutoJumpMaxWorkspacePercent)
+        && value.headlessAutoJumpMaxWorkspacePercent >= 0
+        && value.headlessAutoJumpMaxWorkspacePercent <= 100))
     && typeof value.softMessage === "string"
     && typeof value.hardReasoningMessage === "string"
     && typeof value.hardNonReasoningMessage === "string"
@@ -1203,6 +1320,9 @@ function validOverrides(value: any): value is ConfigOverrides {
     if (!CONFIG_KEYS.includes(key as keyof Config)) return false;
     const item = value[key];
     if (key === "instructions") return item === null || typeof item === "string";
+    if (key === "headlessSoftThresholdPercent") return typeof item === "number" && Number.isFinite(item) && item >= 0 && item <= 100;
+    if (key === "headlessHardThresholdPercent") return typeof item === "number" && Number.isFinite(item) && item > 0 && item <= 100;
+    if (key === "headlessAutoJumpMaxWorkspacePercent") return typeof item === "number" && Number.isFinite(item) && item >= 0 && item <= 100;
     if (key === "workspaceReasoningBufferPercent") return typeof item === "number" && Number.isFinite(item) && item >= 0 && item <= 25;
     if (key === "maxToolOutputTokens") return typeof item === "number" && Number.isSafeInteger(item) && item >= 1;
     if (key === "advertiseVoluntaryCompaction") return typeof item === "boolean";
@@ -1285,11 +1405,40 @@ function loadSavedConfig(ctx: ExtensionContext): void {
     if (project) Object.assign(config, project);
   }
   Object.assign(config, sessionOverrides(ctx));
+  normalizeHeadlessThresholds();
+}
+
+/**
+ * Keeps the headless thresholds coherent with the main ones after every override layer: a
+ * subagent limit above `hardThresholdPercent` would widen rather than narrow the buffer, and a
+ * limit of 0 would put every step under pressure, so both are clamped into a usable range.
+ */
+function normalizeHeadlessThresholds(): void {
+  const hard = Number.isFinite(config.headlessHardThresholdPercent)
+    ? Math.min(Math.max(config.headlessHardThresholdPercent, 1), config.hardThresholdPercent)
+    : DEFAULT_CONFIG.headlessHardThresholdPercent;
+  config.headlessHardThresholdPercent = hard;
+  // The headless advisory band must sit under the headless steer band: an override that puts it
+  // at or above the child's hard limit would silence the advisory, so it falls back to the
+  // default pushed just below that limit.
+  const soft = Number.isFinite(config.headlessSoftThresholdPercent)
+    ? Math.min(Math.max(config.headlessSoftThresholdPercent, 0), 100)
+    : DEFAULT_CONFIG.headlessSoftThresholdPercent;
+  config.headlessSoftThresholdPercent = soft < hard
+    ? soft
+    : Math.min(DEFAULT_CONFIG.headlessSoftThresholdPercent, Math.max(hard - 5, 0));
+  const autoJump = Number.isFinite(config.headlessAutoJumpMaxWorkspacePercent)
+    ? config.headlessAutoJumpMaxWorkspacePercent
+    : DEFAULT_CONFIG.headlessAutoJumpMaxWorkspacePercent;
+  config.headlessAutoJumpMaxWorkspacePercent = Math.min(Math.max(autoJump, 0), 100);
 }
 
 const SETTING_DESCRIPTIONS: Record<keyof Config, string> = {
   softThresholdPercent: "Soft warning threshold: when reached, the model receives an advisory to finish its current sub-task and preserve useful results in a checkpoint payload.",
   hardThresholdPercent: "Hard warning threshold: when context usage reaches this percentage, the model is urgently instructed to return to a checkpoint; reasoning models also receive a synthetic interruption.",
+  headlessSoftThresholdPercent: "Advisory threshold used instead of the soft threshold by a headless (subagent) session. A child has only two pressure bands, an advisory and a steer without thinking, so the advisory starts earlier and the whole span down to the subagent hard threshold is left to the forced jump. Range: 0 to the subagent hard threshold.",
+  headlessHardThresholdPercent: "Hard threshold used instead of the main one by every headless (subagent) calculation: workspace percentage, retrieval budget, tool-output advisory, pagination and read chunk sizing. A subagent cannot interrupt its own reasoning, so it needs the larger buffer; reaching this limit turns thinking off at the end of the current step and steers the jump without interrupting the turn. Range: 1 to the hard threshold.",
+  headlessAutoJumpMaxWorkspacePercent: "Highest workspace utilization a checkpoint may hold for a headless auto-jump to an unknown checkpoint id; the earliest checkpoint is used when it is below this limit, otherwise the jump falls back to checkpoint 0, the snapshot taken right after the assignment. Range: 0-100%.",
   workspaceReasoningBufferPercent: "Context reserved for reasoning while deciding whether a read or retrieved output fits in the available workspace. Only really useful for models that cannot turn thinking off; set it to 0 when your model supports disabling reasoning. Range: 0-25%.",
   maxToolOutputTokens: "Maximum estimated token size for a single non-read tool output before it is paginated. Checkpoint and pagination tools are excluded.",
   minimumJumpDistance: "The minimum workspace utilization difference for a checkpoint jump to be valid when the target is above the soft threshold. Range: 0-100%.",
@@ -1418,6 +1567,12 @@ export default function (pi: ExtensionAPI): void {
   let checkpointJumpNamePending = false;
   let invalidJumpInterruptionTriggered = false;
   let turnInProgress = false;
+  // Counts agent runs (incremented at `before_agent_start`). A follow-up queued by
+  // an aborted stream is only meaningful to the run that was interrupted; when a
+  // new run starts first — pi-subagents sending the child its next instruction,
+  // for instance — the queued notice would otherwise be held by the idle poll and
+  // delivered at the end of the following run as a stale, unanswered message.
+  let runEpoch = 0;
   let rebuildPending = false;
   let pendingUserQueryCheckpointName: string | null = null;
   let pendingUserQueryCheckpointIsInitial = false;
@@ -1442,6 +1597,11 @@ export default function (pi: ExtensionAPI): void {
   // latch resets when its follow-up is delivered or discarded, when pressure is
   // relieved, and whenever compaction completes.
   let hardLimitAbortNotified = false;
+  // A headless child cannot be interrupted mid-step, so its hard notice schedules the
+  // thinking cut instead of forcing it: this flag carries the demand from the dispatch
+  // to `turn_end`, where the step that was already streaming has finished and the next
+  // turn — the one that must carry the jump payload — starts with reasoning disabled.
+  let headlessThinkingOffPending = false;
   // Hard interruptions injected since the assistant last produced any output or
   // tool call. A resumed session can already be over the provider's context
   // window: every request fails instantly and leaves an empty assistant turn,
@@ -1588,6 +1748,15 @@ export default function (pi: ExtensionAPI): void {
   // without reasoning still fits, so the zone is entered after ordinary pressure
   // fired, only if the session kept spending past it.
   const noteEmergencyWorkspace = (ctx: ExtensionContext): boolean => {
+    // A headless subagent never enters the emergency zone. The zone trades an interruptible
+    // reasoning turn and a deferred write batch for raw window room, and a child has no
+    // interrupt to trade: every consumer of this flag ends in `ctx.abort()`, which for a
+    // subagent is read by the parent as the end of the invocation — bug1's empty answer.
+    // Its lower hard limit is the whole safety margin instead (see hardThresholdPercentFor).
+    if (isHeadlessSession(manager(ctx))) {
+      emergencyWorkspaceBreak = false;
+      return false;
+    }
     const ceiling = ceilingWorkspaceTokens(ctx);
     emergencyWorkspaceBreak = ceiling !== null && ceiling <= emergencyWriteThresholdTokens();
     return emergencyWorkspaceBreak;
@@ -1627,6 +1796,16 @@ export default function (pi: ExtensionAPI): void {
       && noteEmergencyWorkspace(ctx);
     return hardThinkingBumpActive;
   };
+
+  // What the emergency zone does for an interactive session — trade thinking for window
+  // room and say so in the notice — is unreachable for a headless child (its zone never
+  // arms, and every consumer of that flag ends in `ctx.abort()`, which would end the
+  // whole invocation). The child's own hard limit plays that role instead: pressure there
+  // exists precisely because an uninterruptible reasoning turn is the failure condition,
+  // so reaching it means thinking must go. A model without reasoning support never gets
+  // it: the level change would be a no-op and the `<think>` stand-in only adds tokens.
+  const headlessThinkingBumpArmed = (ctx: ExtensionContext): boolean =>
+    isHeadlessSession(manager(ctx)) && ctx.model?.reasoning === true;
 
   // Queued work must reach disk. An open batch may finish only while real room
   // remains above the emergency line; once the zone is entered the batch closes as
@@ -1767,7 +1946,10 @@ export default function (pi: ExtensionAPI): void {
   // so no extra continuation message is needed.
   const applyPendingJumpForQueuedInput = (ctx: ExtensionContext): void => {
     const request = pendingJump;
-    if (!request || request.subagent) return;
+    // A headless jump queues its own follow-up directive, so the queued input
+    // reaching here is that directive; applying the branch before it persists is
+    // what frees workspace mid-invocation instead of only at `agent_end`.
+    if (!request) return;
     // The task_completed offer path is applied by the next `input` event.
     if (request.taskCompleted && !request.autoResume) return;
     pendingJump = null;
@@ -1882,6 +2064,7 @@ export default function (pi: ExtensionAPI): void {
   const defaultInstructions = loadAgentInstructions();
   const defaultHeadlessInstructions = loadHeadlessAgentInstructions(defaultInstructions);
   pi.on("before_agent_start", (event, ctx) => {
+    runEpoch += 1;
     // Finalize the headless latch from the effective prompt: pi-subagents
     // stamps every child with an <active_agent> tag plus a sub-agent header,
     // which no main session carries. This is the decisive signal when the
@@ -1979,7 +2162,7 @@ export default function (pi: ExtensionAPI): void {
     const title = hidden > 0 ? `Checkpoints · ${hidden} not usable` : "Checkpoints";
     const empty = candidates.length === 0
       ? "no checkpoints are available on this branch"
-      : `no checkpoint is a valid jump target right now; a jump must free ${String(config.minimumJumpDistance)}% or land at or below ${String(config.softThresholdPercent)}% utilization`;
+      : `no checkpoint is a valid jump target right now; a jump must free ${String(config.minimumJumpDistance)}% or land at or below ${String(softThresholdPercentFor(ctx))}% utilization`;
     // A row id is unique and sits at the start of the row, so the selection maps
     // back to its checkpoint even when a long name was ellipsized.
     const selected = await browseRows(ctx, title, rows, empty);
@@ -2069,6 +2252,9 @@ export default function (pi: ExtensionAPI): void {
     const fields: Array<[keyof Config, string]> = [
       ["softThresholdPercent", "Soft threshold"],
       ["hardThresholdPercent", "Hard threshold"],
+      ["headlessSoftThresholdPercent", "Subagent soft threshold"],
+      ["headlessHardThresholdPercent", "Subagent hard threshold"],
+      ["headlessAutoJumpMaxWorkspacePercent", "Subagent auto-jump workspace limit"],
       ["workspaceReasoningBufferPercent", "Workspace reasoning buffer"],
       ["maxToolOutputTokens", "Maximum tool output size"],
       ["minimumJumpDistance", "Minimum jump distance"],
@@ -2191,7 +2377,7 @@ export default function (pi: ExtensionAPI): void {
         continue;
       }
 
-      if (key === "softThresholdPercent" || key === "hardThresholdPercent" || key === "workspaceReasoningBufferPercent" || key === "maxToolOutputTokens" || key === "minimumJumpDistance") {
+      if (key === "softThresholdPercent" || key === "hardThresholdPercent" || key === "headlessSoftThresholdPercent" || key === "headlessHardThresholdPercent" || key === "headlessAutoJumpMaxWorkspacePercent" || key === "workspaceReasoningBufferPercent" || key === "maxToolOutputTokens" || key === "minimumJumpDistance") {
         const value = await ctx.ui.editor(`Edit ${selected}\n\n${description}`, String(edited[key]));
         if (value == null) continue;
         const number = Number(value);
@@ -2219,6 +2405,9 @@ export default function (pi: ExtensionAPI): void {
 
       if (!(edited.softThresholdPercent < edited.hardThresholdPercent)) {
         ctx.ui.notify("The soft threshold must remain below the hard threshold.", "error");
+      }
+      if (!(edited.headlessSoftThresholdPercent < edited.headlessHardThresholdPercent)) {
+        ctx.ui.notify("The subagent soft threshold must remain below the subagent hard threshold.", "error");
       }
     }
 
@@ -2411,7 +2600,7 @@ ${checkpointListForInterruption(ctx)}`;
   const jumpTargetMeetsMinimumDistance = (sm: SessionManager, targetId: number, ctx: ExtensionContext): boolean => {
     const checkpoint = checkpointEntries(sm).find((entry) => entry.checkpoint.id === targetId)?.checkpoint;
     if (!checkpoint) return false;
-    return checkpointMeetsMinimumJumpDistance(checkpoint, workspaceUsedPercent(ctx));
+    return checkpointMeetsMinimumJumpDistance(checkpoint, workspaceUsedPercent(ctx), softThresholdPercentFromSm(sm));
   };
 
   const interruptInvalidCheckpointJump = (ctx: ExtensionContext, target: unknown): void => {
@@ -2444,6 +2633,11 @@ ${checkpointListForInterruption(ctx)}`;
 
     const target = args.target;
     const sm = manager(ctx);
+    // A headless child gets no interruption: an abort here would end the
+    // invocation with the payload lost, because the child cannot answer a notice
+    // telling it to retry. Let the stream finish and let `executeCheckpointJump`
+    // substitute a usable target instead.
+    if (isHeadlessSession(sm)) return;
     const targetIsValid = typeof target === "number"
       && Number.isInteger(target)
       && resolveCheckpointId(sm, target) !== undefined
@@ -2544,6 +2738,11 @@ ${checkpointListForInterruption(ctx)}`;
     // truncate a turn with no continuation to explain it. The output clamp and the
     // terminal wall own that state instead.
     if (streamedMutationInterrupted || hardInterruptionStalled) return;
+    // A headless child is never interrupted: aborting a stream makes pi return from the
+    // turn at once, so the parent's awaited prompt settles on partial text and the queued
+    // notice becomes the result (bug1). Its lower hard limit and deferred thinking cut
+    // are the whole protection; the emergency zone does not apply to it.
+    if (isHeadlessSession(manager(ctx))) return;
     if (jumpPayloadInFlight()) return;
     let name = streamed.name;
     let args = streamed.args;
@@ -2618,6 +2817,13 @@ ${checkpointListForInterruption(ctx)}`;
   const TERMINAL_ANSWER_RESERVE_TOKENS = 512;
 
   const terminalCeilingReached = (ctx: ExtensionContext): boolean => {
+    // The terminal wall is the token-sized zone just under the window, and that zone
+    // belongs to the interactive path: it exists because a session inside it can still
+    // be interrupted and answered. A headless child has no such interrupt support, so
+    // its bands stop at the hard threshold and 100% is an ordinary failure. Reporting
+    // "recover with /tree" to a child nobody can hand a keyboard would only bury the
+    // provider error the parent is supposed to see.
+    if (isHeadlessSession(manager(ctx))) return false;
     if (config.outputMarginFloorTokens === null) return false;
     const ceiling = ceilingWorkspaceTokens(ctx);
     if (ceiling === null) return false;
@@ -2684,14 +2890,32 @@ ${checkpointListForInterruption(ctx)}`;
     // notice that follows the dangerous write.
     // Armed by the deferral that held pressure back and by a write/edit that
     // completed just before this notice; consumed here so it appears once.
-    const emergencyAdvisory = emergencyWriteBreakPending || lastToolCallWasFileMutation
+    // A headless child has no emergency band: `noteEmergencyWorkspace` never latches
+    // for it and streamed file mutations are never interrupted, so the only signal
+    // that could arm this advisory is an ordinary write that happened to be the last
+    // tool call. Telling such a child "no further write is safe" makes it jump early
+    // out of pure caution, wasting a payload it did not need to spend.
+    const headless = isHeadlessSession(manager(ctx));
+    const emergencyAdvisory = !headless && (emergencyWriteBreakPending || lastToolCallWasFileMutation)
       ? `${EMERGENCY_WRITE_ADVISORY}\n\n`
       : "";
     emergencyWriteBreakPending = false;
     lastToolCallWasFileMutation = false;
+    const retrieval = retrievalWorkspaceTokens(ctx);
+    // Exhausted retrieval is not the same situation for a headless child. pi returns
+    // from an aborted turn immediately (agent-loop.js:148-158), so the parent's
+    // awaited prompt settles on whatever partial text streamed and the queued notice
+    // starts a fresh run nobody awaits — that is how bug1 lost a report that had
+    // already been written. Such a child therefore never aborts: it keeps its stream,
+    // has its reasoning cut between steps instead, and gets the notice steered into
+    // the same live invocation (agent-loop.js:90/:186 drains steering inside the
+    // running loop). There is no token-sized fallback zone below the window for it;
+    // if it cannot jump out, exhausting the context is simply a failure.
     // The notice variant and the thinking level must agree: the `<think>` block
-    // only stands in for reasoning that this dispatch actually removes.
-    const bumpThinking = hardThinkingBumpArmed(ctx);
+    // only stands in for reasoning that this dispatch actually removes. For a headless
+    // child that removal is deferred to `turn_end`, but the wording still has to match
+    // the level the run ends up with.
+    const bumpThinking = hardThinkingBumpArmed(ctx) || headlessThinkingBumpArmed(ctx);
     const message = hardInterruptionMessage(ctx, emergencyAdvisory, bumpThinking);
 
     // Ordinary hard steering is queued and lands at the next step boundary, so a
@@ -2702,8 +2926,7 @@ ${checkpointListForInterruption(ctx)}`;
     // run settles, reusing the pattern already proven for invalid jumps. This
     // abort is unconditional: at exhausted retrieval it is the only path that
     // leaves room for the jump payload, so it is not user-configurable.
-    const retrieval = retrievalWorkspaceTokens(ctx);
-    if (turnInProgress && !ctx.isIdle() && retrieval !== null && retrieval <= 0) {
+    if (turnInProgress && !ctx.isIdle() && retrieval !== null && retrieval <= 0 && !headless) {
       try {
         // Exhausted retrieval alone no longer trades thinking for tokens: only
         // a bump armed inside the emergency zone does. The abort stays
@@ -2735,6 +2958,11 @@ ${checkpointListForInterruption(ctx)}`;
       return;
     }
 
+    // A headless child keeps its stream, so its reasoning is cut between steps rather
+    // than inside one: the notice schedules the cut for `turn_end` instead of forcing
+    // it while the current step is still reasoning.
+    if (headless && bumpThinking) headlessThinkingOffPending = true;
+
     try {
       // Re-apply this immediately before dispatching. The runtime can prepare
       // the next turn after turn_end and overwrite the level set earlier.
@@ -2742,7 +2970,9 @@ ${checkpointListForInterruption(ctx)}`;
       // user's original level. Ordinary pressure no longer trades thinking for
       // tokens; only usage inside the emergency zone forces the off this notice
       // expects.
-      if (bumpThinking) forceThinkingOff();
+      // A headless dispatch defers the level change to `turn_end`; forcing it here
+      // would claim the capture slot while the current step is still reasoning.
+      if (bumpThinking && !headless) forceThinkingOff();
       // Preserve immediate interruption in every case except a checkpoint
       // jump already visible in the streamed assistant response.
       pi.sendUserMessage(message, { deliverAs: ctx.isIdle() ? "followUp" : "steer" });
@@ -2806,11 +3036,15 @@ ${checkpointListForInterruption(ctx)}`;
     if (jumpPending || postJumpTurnProtected) return;
     const percent = usagePercent(ctx);
     if (percent == null) return;
+    // A headless child is measured against its own lower limits: the advisory fires earlier and
+    // the hard notice fires sooner, so room for an uninterruptible reasoning turn still exists.
+    const hardPercent = hardThresholdPercentFor(ctx);
+    const softPercent = softThresholdPercentFor(ctx);
     // Each warning re-arms independently when usage falls below its threshold.
     // This matters after voluntary compaction: usage may fall below hard while
     // remaining above soft, and the next hard breach must still warn again.
-    if (percent < config.softThresholdPercent) softFired = false;
-    if (percent < config.hardThresholdPercent) {
+    if (percent < softPercent) softFired = false;
+    if (percent < hardPercent) {
       if (!hardJumpPending && !hardInterruptionCancelledForJump && !checkpointJumpCallInProgress) hardFired = false;
       assistantBumpPending = false;
       // Pressure relieved (a jump, /tree or ordinary work lowered usage), so a
@@ -2819,6 +3053,9 @@ ${checkpointListForInterruption(ctx)}`;
       interruptionsSinceAssistantProgress = 0;
       hardInterruptionStalled = false;
       hardLimitAbortNotified = false;
+      // Usage fell back under the hard threshold, so the deferred thinking cut armed
+      // by the last headless notice no longer has a reason to fire.
+      headlessThinkingOffPending = false;
       // An emergency advisory armed by a write that never got its interruption
       // (the turn was cancelled, or /tree rewound to an earlier node) must not
       // claim "no further write is safe" in a branch that has room again. Only
@@ -2829,14 +3066,14 @@ ${checkpointListForInterruption(ctx)}`;
         emergencyWriteBreakPending = false;
       }
     }
-    if (percent < config.softThresholdPercent) return;
+    if (percent < softPercent) return;
     // Retrieval workspace is exhausted once tokens reach the configured hard
     // percent of the context window (raw retrieval figure; the reasoning buffer
     // is reserved inside sizing hints, not here).
     const retrieval = retrievalWorkspaceTokens(ctx);
     const exhausted = retrieval !== null && retrieval <= 0;
     const emergency = noteEmergencyWorkspace(ctx);
-    if (percent >= config.hardThresholdPercent || exhausted) {
+    if (percent >= hardPercent || exhausted) {
       triggerHardInterruption(ctx, exhausted);
       return;
     }
@@ -2858,7 +3095,7 @@ ${checkpointListForInterruption(ctx)}`;
         // model conversation. A non-triggering custom message can be displayed
         // in the TUI yet remain queued instead of steering the next request.
         pi.sendUserMessage(config.softMessage, { deliverAs: "steer" });
-        if (ctx.hasUI) ctx.ui.notify(`pi-voluntary-compaction: soft warning (${config.softThresholdPercent}%)`, "warning");
+        if (ctx.hasUI) ctx.ui.notify(`pi-voluntary-compaction: soft warning (${String(softPercent)}%)`, "warning");
       } catch {
         // Do not permanently suppress the warning if the runtime rejects it.
         softFired = false;
@@ -2900,6 +3137,7 @@ ${checkpointListForInterruption(ctx)}`;
     pendingHardLimitFollowup = null;
     hardLimitFollowupPending = false;
     hardLimitAbortNotified = false;
+    headlessThinkingOffPending = false;
     interruptionsSinceAssistantProgress = 0;
     hardInterruptionStalled = false;
     interruptionDispatchedThisTurn = false;
@@ -3406,6 +3644,19 @@ ${checkpointListForInterruption(ctx)}`;
     if (hardInterruptionPending && !checkpointJumpCallInProgress && !checkpointJumpNamePending) {
       dispatchHardInterruption(ctx);
     }
+    // The step that carried a headless hard notice has finished, so its deferred
+    // thinking cut lands here — before the next request composes the jump payload.
+    // Pressure relieved during the step (a voluntary jump, /tree, ordinary work) drops
+    // the demand instead: nothing is left to trade, and the level stays as configured.
+    if (headlessThinkingOffPending) {
+      headlessThinkingOffPending = false;
+      if (hardPressureActive()) {
+        forceThinkingOff();
+        logInterceptor("headless_thinking_off_after_step", pressureState());
+      } else {
+        logInterceptor("headless_thinking_off_dropped_for_relief", pressureState());
+      }
+    }
     postJumpTurnProtected = false;
     // The arming is scoped to the write that produced it, not to one turn. A batch
     // deferral keeps pressure pending across this boundary (bug19: the batch guard
@@ -3590,7 +3841,7 @@ ${checkpointListForInterruption(ctx)}`;
     const currentCap = request[currentField] as number;
     // pi's clamp: contextWindow - estimated input - CONTEXT_SAFETY_TOKENS(4096),
     // floored at 1. Give the jump answer `outputMarginFloorTokens` instead.
-    const nextCap = Math.max(contextWindow - estimatedInputTokens - config.outputMarginFloorTokens, 256);
+    let nextCap = Math.max(contextWindow - estimatedInputTokens - config.outputMarginFloorTokens, 256);
     if (currentCap >= nextCap) return;
     logInterceptor("hard_pressure_output_margin_raised", {
       model: ctx.model?.id ?? null,
@@ -3649,7 +3900,7 @@ ${checkpointListForInterruption(ctx)}`;
         formatCheckpointLabel(checkpoint, workspaceDelta));
       const used = usagePercent(ctx);
       if (checkpoints.length > config.crowdedCheckpointsLimit
-        && (used ?? 0) < config.hardThresholdPercent) {
+        && (used ?? 0) < hardThresholdPercentFor(ctx)) {
         lines.push("", `[There is a large number of checkpoints with locked-in payload. You should jump to earliest checkpoint available (#${checkpoints[0]!.checkpoint.id}) and distill all your locked-in checkpoints and current state into one payload; then lock-in the combined payload after jump.]`);
       }
       return textResult(lines.join("\n") || "(no checkpoints with sufficient workspace utilization difference)");
@@ -3673,42 +3924,83 @@ ${checkpointListForInterruption(ctx)}`;
     ctx: ExtensionContext,
   ) => {
     const sm = manager(ctx);
-    const target = resolveCheckpointId(sm, params.target);
+    const headless = isHeadlessSession(sm);
+    let checkpointId = params.target;
+    let target = resolveCheckpointId(sm, checkpointId);
+    let autoJumped = false;
+    // A rejected target is a dead end for a headless child: it has no user to
+    // ask for a better ID and no UI to report the refusal in, so it would keep
+    // the whole tree in place until pressure stalls it. Substitute the earliest
+    // checkpoint that actually frees workspace instead of returning an error.
+    if (headless && (!target || !jumpTargetMeetsMinimumDistance(sm, checkpointId, ctx))) {
+      const fallback = headlessFallbackJumpTarget(sm);
+      if (fallback) {
+        autoJumped = true;
+        checkpointId = fallback.id;
+        target = fallback.targetId;
+        logInterceptor("headless_invalid_jump_autojump", {
+          requested: params.target,
+          used: checkpointId,
+        });
+      }
+    }
     if (!target) return textResult(`Checkpoint #${params.target} was not found. Use checkpoint_list to inspect available checkpoints.`);
     // Keep hard-limit reasoning disabled until a target with enough workspace
     // distance has been accepted.
-    if (!jumpTargetMeetsMinimumDistance(sm, params.target, ctx)) return invalidJumpTargetResult(ctx);
+    if (!jumpTargetMeetsMinimumDistance(sm, checkpointId, ctx)) return invalidJumpTargetResult(ctx);
     // Validate before clearing hard-pressure flags so a rejected forced jump
     // keeps reasoning disabled until a suitable jump is accepted.
     const payloadError = jumpPayloadError(params.payload);
     if (payloadError) return textResult(payloadError);
-    const jumpNotice = checkpointJumpNotice(sm, params.target);
+    const jumpNotice = checkpointJumpNotice(sm, checkpointId);
     const leaf = sm.getLeafId();
     const autoResume = hardJumpPending || hardInterruptionCancelledForJump;
     if (leaf === target) {
-      return textResult(params.target === 0 ? "Already at checkpoint." : `Already at checkpoint [${params.target}].`);
+      return textResult(checkpointId === 0 ? "Already at checkpoint." : `Already at checkpoint [${checkpointId}].`);
     }
-    const headless = isHeadlessSession(sm);
     const taskCompleted = headless || autoResume ? false : (params.task_completed ?? false);
     jumpPending = true;
     cancelHardInterruptionForJump();
     if (headless) {
-      // Do not terminate a headless session's prompt at the jump tool. The
-      // parent runner treats termination as the end of the invocation and can
-      // return an empty result before a deferred continuation is observed. The
-      // tool result already carries the payload, so let the model finish
-      // naturally.
-      pendingJump = { target, checkpointId: params.target, payload: params.payload, taskCompleted: false, subagent: true, autoResume };
-      return payloadResult(params.target === 0
-        ? "Checkpoint jump is pending while this headless session completes; payload retained."
-        : `Checkpoint jump to [${params.target}] is pending while this headless session completes; payload retained.`, params.payload);
+      // A headless child has to free workspace inside the same invocation: a
+      // branch deferred to `agent_end` leaves the whole tree in place, so
+      // pressure keeps climbing and the child stalls with the task unfinished.
+      // Pi's outer run loop drains queued follow-ups before it emits `agent_end`
+      // (pi-agent-core/dist/agent-loop.js:197-203), so a follow-up directive
+      // keeps the parent's awaited `session.prompt()` alive while
+      // `applyPendingJumpForQueuedInput` rewinds the branch as that message
+      // starts. `terminate: true` only stops further tool calls in this turn
+      // (agent-loop.js:172) — it does not end the invocation, so the parent
+      // cannot mistake the jump for a finished answer.
+      pendingJump = { target, checkpointId, payload: params.payload, taskCompleted: false, subagent: true, autoResume };
+      const continuation = [
+        "[CHECKPOINT JUMP APPLIED]",
+        `Restored to checkpoint [${checkpointId}] with the payload above.`,
+        "Continue the task: do not redo work the payload records as done, carry on with the next unfinished step.",
+      ].join("\n");
+      const applied = autoJumped
+        ? `Requested checkpoint [${params.target}] was an invalid target; jumped to [${checkpointId}] instead, which frees enough workspace. Continuing from the restored checkpoint.`
+        : checkpointId === 0
+          ? "Checkpoint jump applied; continuing from the restored checkpoint."
+          : `Checkpoint jump to [${checkpointId}] applied; continuing from the restored checkpoint.`;
+      try {
+        pi.sendUserMessage(continuation, { deliverAs: "followUp" });
+        return {
+          ...payloadResult(applied, params.payload),
+          terminate: true,
+        };
+      } catch {
+        // Queueing failed, so keep the old deferral: `agent_end` still applies
+        // the retained branch rather than losing the jump.
+        return payloadResult(`${applied} The continuation could not be queued, so the jump is pending while this headless session completes; payload retained.`, params.payload);
+      }
     }
-    pendingJump = { target, checkpointId: params.target, payload: params.payload, taskCompleted, subagent: false, autoResume };
+    pendingJump = { target, checkpointId, payload: params.payload, taskCompleted, subagent: false, autoResume };
     return {
       ...payloadResult(taskCompleted
-        ? params.target === 0
+        ? checkpointId === 0
           ? "Jump to checkpoint is pending after next user input."
-          : `Jump to checkpoint [${params.target}] is pending after next user input.`
+          : `Jump to checkpoint [${checkpointId}] is pending after next user input.`
         : jumpNotice, params.payload),
       terminate: true,
     };
@@ -3905,7 +4197,31 @@ ${checkpointListForInterruption(ctx)}`;
         hardLimitAbortNotified = false;
       }
       if (forcedInterruptions.length > 0) {
+        // A headless child answers its parent with an assistant message. A notice
+        // appended after the run is over is the last entry in the transcript, with
+        // nothing answering it, so pi-subagents hands the parent VC's own warning
+        // instead of the child's report (bug1). Mid-run injections are unaffected.
+        if (isHeadlessSession(manager(ctx))) {
+          logInterceptor("forced_followup_skipped_headless", {
+            queued: forcedInterruptions.length,
+            ...pressureState(),
+          });
+          return;
+        }
+        const queuedRunEpoch = runEpoch;
         const deliverAfterAbort = (): void => {
+          // The interruption belongs to a run that has already been replaced; the
+          // evaluator re-arms pressure at the next `turn_start` if it is still due,
+          // so dropping it here loses nothing.
+          if (runEpoch !== queuedRunEpoch) {
+            logInterceptor("forced_followup_dropped_stale", {
+              queued: forcedInterruptions.length,
+              queuedRunEpoch,
+              runEpoch,
+              ...pressureState(),
+            });
+            return;
+          }
           if (!ctx.isIdle()) {
             setTimeout(deliverAfterAbort, 25);
             return;
@@ -3964,10 +4280,22 @@ ${checkpointListForInterruption(ctx)}`;
           renderCompactionOffer(ctx);
           if (process.env.PI_WEB_SESSION === "1") announceWebCompactionOffer(pendingJumpOffer);
         } else {
-          // Headless callers retain the original task_completed behavior.
+          // Headless callers retain the original task_completed behavior, except
+          // when the run it terminates had nothing to report: read the verdict from
+          // the live branch before rewinding, since after the branch write the old
+          // tail is gone. The child then continues on the compacted payload and
+          // still produces its answer instead of an empty result (bug1).
+          const headlessNeedsContinuation = request.subagent && runEndedWithoutAnswer(sm);
           branchWithCheckpointVisibilitySnapshot(pi, sm, request.target, request.checkpointId, request.payload);
           markCompactionComplete();
-          if ((!request.taskCompleted || request.autoResume) && !request.subagent) {
+          if (headlessNeedsContinuation) {
+            logInterceptor("headless_jump_continued", {
+              checkpointId: request.checkpointId,
+              ...pressureState(),
+            });
+          }
+          if ((!request.taskCompleted || request.autoResume)
+            && (!request.subagent || headlessNeedsContinuation)) {
             // Start only after the branch write and agent_end cleanup have settled.
             // This avoids losing the trigger when the runtime is still completing
             // the terminating turn that contained checkpoint_jump.

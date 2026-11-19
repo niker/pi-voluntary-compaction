@@ -2,6 +2,33 @@
 export type Config = {
   softThresholdPercent: number;
   hardThresholdPercent: number;
+  /**
+   * Soft advisory threshold used instead of `softThresholdPercent` by a headless
+   * (subagent) session. Headless pressure has only two bands — an advisory and a
+   * steer — because a child cannot interrupt its own reasoning, so the advisory
+   * band starts earlier to leave the whole remaining buffer to the forced jump.
+   * Default 70. Range: 0-`headlessHardThresholdPercent` (a larger value is
+   * clamped below it).
+   */
+  headlessSoftThresholdPercent: number;
+  /**
+   * Hard threshold used by every headless (subagent) calculation instead of
+   * `hardThresholdPercent`: workspace percentage, retrieval budget, tool-output
+   * advisory, pagination and read chunk sizing all cap at this value. Headless
+   * sessions cannot interrupt a reasoning turn, so an unbounded thinking step
+   * that starts near the ceiling is the failure condition; the extra buffer is
+   * what keeps the forced jump inside the output margin. Default 80. Range:
+   * 1-`hardThresholdPercent` (a larger value is clamped down to it).
+   */
+  headlessHardThresholdPercent: number;
+  /**
+   * Highest workspace utilization, in percent, of a checkpoint that a headless
+   * auto-jump may pick when the agent asks for an id that does not exist. The
+   * earliest eligible checkpoint is used only while it is below this limit,
+   * otherwise the jump falls back to checkpoint 0 (the initial-query snapshot
+   * taken right after the master agent's assignment). Default 20. Range: 0-100.
+   */
+  headlessAutoJumpMaxWorkspacePercent: number;
   /** Reasoning reserve applied to retrieval/read sizing hints. */
   workspaceReasoningBufferPercent: number;
   maxToolOutputTokens: number;
@@ -56,6 +83,9 @@ export type Config = {
 export const DEFAULT_CONFIG: Config = {
   softThresholdPercent: 75,
   hardThresholdPercent: 85,
+  headlessSoftThresholdPercent: 70,
+  headlessHardThresholdPercent: 80,
+  headlessAutoJumpMaxWorkspacePercent: 20,
   workspaceReasoningBufferPercent: 2.5,
   maxToolOutputTokens: 8000,
   minimumJumpDistance: 7.5,
